@@ -36,15 +36,29 @@ from rich.text import Text
 load_dotenv()
 
 
+import yaml
+
+class ConnectionConfig(BaseModel):
+    base_url: str
+    api_key: str
+    target_model: str
+
+class MappingsConfig(BaseModel):
+    big_model: str
+    medium_model: str
+    small_model: str
+
+class ProxyConfig(BaseModel):
+    proxy_api_key: Optional[str] = None
+    mappings: MappingsConfig
+    connections: Dict[str, ConnectionConfig]
+
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
 
     model_config = SettingsConfigDict(env_file="../../.env", extra="ignore")
 
-    openai_api_key: str
-    big_model_name: str
-    small_model_name: str
-    base_url: str = "https://openrouter.ai/api/v1"
+    config_path: str = "config.yaml"
     referer_url: str = "http://localhost:8080/claude_proxy"
 
     app_name: str = "AnthropicProxy"
@@ -55,37 +69,36 @@ class Settings(BaseSettings):
     port: int = 8080
     reload: bool = True
 
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self._validate_required_models()
-
-    def _validate_required_models(self):
-        """Validate that required model settings are configured."""
-        errors = []
-        
-        if not self.big_model_name.strip():
-            errors.append(
-                "BIG_MODEL_NAME is required but not configured. "
-                "Please set the BIG_MODEL_NAME environment variable or add it to your .env file."
-            )
-        
-        if not self.small_model_name.strip():
-            errors.append(
-                "SMALL_MODEL_NAME is required but not configured. "
-                "Please set the SMALL_MODEL_NAME environment variable or add it to your .env file."
-            )
-        
-        if errors:
-            error_message = "\n".join([f"❌ {error}" for error in errors])
-            _error_console.print(f"\n[bold red]Configuration Error:[/bold red]\n{error_message}\n")
-            sys.exit(1)
-
-
 settings = Settings()
-
 
 _console = Console()
 _error_console = Console(stderr=True, style="bold red")
+
+proxy_config: ProxyConfig
+clients_pool: Dict[str, openai.AsyncClient] = {}
+
+def load_proxy_config() -> None:
+    global proxy_config, clients_pool
+    try:
+        with open(settings.config_path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+        proxy_config = ProxyConfig(**data)
+    except Exception as e:
+        _error_console.print(f"[bold red]Configuration Error:[/bold red] Failed to load {settings.config_path}: {e}")
+        sys.exit(1)
+
+    for conn_id, conn_cfg in proxy_config.connections.items():
+        clients_pool[conn_id] = openai.AsyncClient(
+            api_key=conn_cfg.api_key,
+            base_url=conn_cfg.base_url,
+            default_headers={
+                "HTTP-Referer": settings.referer_url,
+                "X-Title": settings.app_name,
+            },
+            timeout=180.0,
+        )
+
+load_proxy_config()
 
 
 class JSONFormatter(logging.Formatter):
@@ -464,25 +477,7 @@ def extract_provider_error_details(
     )
 
 
-try:
-    openai_client = openai.AsyncClient(
-        api_key=settings.openai_api_key,
-        base_url=settings.base_url,
-        default_headers={
-            "HTTP-Referer": settings.referer_url,
-            "X-Title": settings.app_name,
-        },
-        timeout=180.0,
-    )
-except Exception as e:
-    critical(
-        LogRecord(
-            event="openai_client_init_failed",
-            message="Failed to initialize OpenAI client",
-        ),
-        exc=e,
-    )
-    sys.exit(1)
+
 
 
 _token_encoder_cache: Dict[str, tiktoken.Encoding] = {}
