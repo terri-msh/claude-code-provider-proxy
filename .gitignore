@@ -180,3 +180,4 @@ log.jsonl
 .aider*
 
 **/.claude/settings.local.json
+config.yaml
