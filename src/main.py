@@ -1384,41 +1384,32 @@ app = fastapi.FastAPI(
 )
 
 
-def select_target_model(client_model_name: str, request_id: str) -> str:
-    """Selects the target OpenRouter model based on the client's request."""
-    target_model: str
-    if client_model_name.startswith("openrouter/"):
-        target_model = client_model_name[len("openrouter/") :]
+def select_connection(client_model_name: str, request_id: str) -> Tuple[ConnectionConfig, openai.AsyncClient]:
+    """Selects the target connection config and client based on the client's request."""
+    client_model_lower = client_model_name.lower()
+    
+    if "opus" in client_model_lower:
+        target_conn_id = proxy_config.mappings.big_model
+    elif "sonnet" in client_model_lower:
+        target_conn_id = proxy_config.mappings.medium_model
+    elif "haiku" in client_model_lower:
+        target_conn_id = proxy_config.mappings.small_model
     else:
-        client_model_lower = client_model_name.lower()
-
-        if "opus" in client_model_lower or "sonnet" in client_model_lower:
-            target_model = settings.big_model_name
-        elif "haiku" in client_model_lower:
-            target_model = settings.small_model_name
-        else:
-            target_model = settings.small_model_name
-            warning(
-                LogRecord(
-                    event=LogEvent.MODEL_SELECTION.value,
-                    message=f"Unknown client model '{client_model_name}', defaulting to SMALL model '{target_model}'.",
-                    request_id=request_id,
-                    data={
-                        "client_model": client_model_name,
-                        "default_target_model": target_model,
-                    },
-                )
+        target_conn_id = proxy_config.mappings.small_model
+        warning(
+            LogRecord(
+                event=LogEvent.MODEL_SELECTION.value,
+                message=f"Unknown client model '{client_model_name}', defaulting to SMALL mapping '{target_conn_id}'.",
+                request_id=request_id,
             )
-
-    debug(
-        LogRecord(
-            event=LogEvent.MODEL_SELECTION.value,
-            message=f"Client model '{client_model_name}' mapped to target model '{target_model}'.",
-            request_id=request_id,
-            data={"client_model": client_model_name, "target_model": target_model},
         )
-    )
-    return target_model
+    
+    if target_conn_id not in proxy_config.connections:
+        error_msg = f"Target connection '{target_conn_id}' is not defined in config.yaml"
+        critical(LogRecord(event=LogEvent.MODEL_SELECTION.value, message=error_msg))
+        raise Exception(error_msg)
+        
+    return proxy_config.connections[target_conn_id], clients_pool[target_conn_id]
 
 
 def _build_anthropic_error_response(
@@ -1497,6 +1488,12 @@ async def create_message_proxy(
     request.state.request_id = request_id
     request.state.start_time_monotonic = time.monotonic()
 
+    api_key = request.headers.get("x-api-key")
+    if proxy_config.proxy_api_key and api_key != proxy_config.proxy_api_key:
+        return _build_anthropic_error_response(
+            AnthropicErrorType.AUTHENTICATION, "Invalid API key", 401
+        )
+
     try:
         raw_body = await request.json()
         debug(
@@ -1529,7 +1526,8 @@ async def create_message_proxy(
         )
 
     is_stream = anthropic_request.stream or False
-    target_model_name = select_target_model(anthropic_request.model, request_id)
+    target_conn, target_client = select_connection(anthropic_request.model, request_id)
+    target_model_name = target_conn.target_model
 
     estimated_input_tokens = count_tokens_for_anthropic_request(
         messages=anthropic_request.messages,
@@ -1615,7 +1613,7 @@ async def create_message_proxy(
                     request_id,
                 )
             )
-            openai_stream_response = await openai_client.chat.completions.create(
+            openai_stream_response = await target_client.chat.completions.create(
                 **openai_params
             )
             return StreamingResponse(
@@ -1704,6 +1702,10 @@ async def count_tokens_endpoint(request: Request) -> TokenCountResponse:
     request_id = str(uuid.uuid4())
     request.state.request_id = request_id
     start_time_mono = time.monotonic()
+
+    api_key = request.headers.get("x-api-key")
+    if proxy_config.proxy_api_key and api_key != proxy_config.proxy_api_key:
+        raise fastapi.HTTPException(status_code=401, detail="Invalid API key")
 
     try:
         body = await request.json()
