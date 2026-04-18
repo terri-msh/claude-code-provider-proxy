@@ -86,10 +86,27 @@ import httpx
 
 VERBOSE_LOGGING = "--verbose" in sys.argv
 
+def truncate_long_strings(obj):
+    if isinstance(obj, dict):
+        return {k: truncate_long_strings(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [truncate_long_strings(v) for v in obj]
+    elif isinstance(obj, str):
+        if len(obj) > 300:
+            return f"... [truncated {len(obj)-200} chars] ...\n{obj[-200:]}"
+        return obj
+    return obj
+
 def format_log_body(body_str: str) -> str:
-    if VERBOSE_LOGGING or len(body_str) <= 100:
+    try:
+        parsed = json.loads(body_str)
+        if not VERBOSE_LOGGING:
+            parsed = truncate_long_strings(parsed)
+        return json.dumps(parsed, indent=2, ensure_ascii=False)
+    except Exception:
+        if not VERBOSE_LOGGING and len(body_str) > 500:
+            return f"{body_str[:200]}\n... [truncated] ...\n{body_str[-200:]}"
         return body_str
-    return f"...{body_str[-100:]}"
 
 class YandexAuth(httpx.Auth):
     def __init__(self, token: str):
