@@ -14,6 +14,7 @@ import traceback
 import uuid
 from datetime import datetime, timezone
 from logging.config import dictConfig
+from pathlib import Path
 from typing import (Any, AsyncGenerator, Awaitable, Callable, Dict, List,
                     Literal, Optional, Tuple, Union, cast)
 
@@ -21,7 +22,7 @@ import fastapi
 import openai
 import tiktoken
 import uvicorn
-from dotenv import load_dotenv
+from dotenv import load_dotenv, set_key
 from fastapi import Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from openai.types.chat import (ChatCompletionMessageParam,
@@ -37,11 +38,15 @@ load_dotenv()
 
 
 import yaml
+import setproctitle
+
+setproctitle.setproctitle("claude-code-proxy")
 
 class ConnectionConfig(BaseModel):
     base_url: str
     api_key: str
     target_model: str
+    provider: Optional[List[str]] = None
 
 class MappingsConfig(BaseModel):
     big_model: str
@@ -63,7 +68,7 @@ class Settings(BaseSettings):
 
     app_name: str = "AnthropicProxy"
     app_version: str = "0.2.0"
-    log_level: str = "INFO"
+    log_level: str = "DEBUG"
     log_file_path: Optional[str] = "log.jsonl"
     host: str = "127.0.0.1"
     port: int = 8080
@@ -77,6 +82,35 @@ _error_console = Console(stderr=True, style="bold red")
 proxy_config: ProxyConfig
 clients_pool: Dict[str, openai.AsyncClient] = {}
 
+import httpx
+
+VERBOSE_LOGGING = "--verbose" in sys.argv
+
+def format_log_body(body_str: str) -> str:
+    if VERBOSE_LOGGING or len(body_str) <= 100:
+        return body_str
+    return f"...{body_str[-100:]}"
+
+class YandexAuth(httpx.Auth):
+    def __init__(self, token: str):
+        self.token = token
+
+    def auth_flow(self, request: httpx.Request):
+        request.headers["Authorization"] = self.token
+        yield request
+
+async def log_request_hook(request: httpx.Request):
+    body = request.read().decode("utf-8", errors="ignore") if request.stream else "stream"
+    print(f"\n[HTTPX OUTGOING] {request.method} {request.url}\nHEADERS: {dict(request.headers)}\nBODY: {format_log_body(body)}\n")
+
+async def log_response_hook(response: httpx.Response):
+    try:
+        await response.aread()
+        body = response.text
+    except Exception:
+        body = "<could not read>"
+    print(f"\n[HTTPX INCOMING] {response.status_code} {response.url}\nHEADERS: {dict(response.headers)}\nBODY: {format_log_body(body)}\n")
+
 def load_proxy_config() -> None:
     global proxy_config, clients_pool
     try:
@@ -88,6 +122,12 @@ def load_proxy_config() -> None:
         sys.exit(1)
 
     for conn_id, conn_cfg in proxy_config.connections.items():
+        http_client = httpx.AsyncClient(
+            event_hooks={'request': [log_request_hook], 'response': [log_response_hook]},
+            verify=False,
+            timeout=180.0,
+            auth=YandexAuth(conn_cfg.api_key)
+        )
         clients_pool[conn_id] = openai.AsyncClient(
             api_key=conn_cfg.api_key,
             base_url=conn_cfg.base_url,
@@ -95,7 +135,7 @@ def load_proxy_config() -> None:
                 "HTTP-Referer": settings.referer_url,
                 "X-Title": settings.app_name,
             },
-            timeout=180.0,
+            http_client=http_client,
         )
 
 load_proxy_config()
@@ -128,21 +168,127 @@ class JSONFormatter(logging.Formatter):
         return json.dumps(header, ensure_ascii=False)
 
 
-class ConsoleJSONFormatter(JSONFormatter):
-    def format(self, record: logging.LogRecord) -> str:
-        log_dict = json.loads(super().format(record))
-        if (
-            "detail" in log_dict
-            and "error" in log_dict["detail"]
-            and log_dict["detail"]["error"]
-        ):
-            if "stack_trace" in log_dict["detail"]["error"]:
-                del log_dict["detail"]["error"]["stack_trace"]
-        elif "error" in log_dict and log_dict["error"]:
-            if "stack_trace" in log_dict["error"]:
-                del log_dict["error"]["stack_trace"]
-        return json.dumps(log_dict)
+_LEVEL_STYLES = {
+    "DEBUG":    ("dim cyan",    "DBG"),
+    "INFO":     ("bold green",  "INF"),
+    "WARNING":  ("bold yellow", "WRN"),
+    "ERROR":    ("bold red",    "ERR"),
+    "CRITICAL":  ("bold white on red", "CRT"),
+}
 
+_log_console = Console(highlight=False)
+
+
+class PrettyConsoleFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        ts = datetime.fromtimestamp(record.created).strftime("%H:%M:%S.%f")[:-3]
+        style, badge = _LEVEL_STYLES.get(record.levelname, ("default", record.levelname[:3]))
+
+        log_payload: Optional["LogRecord"] = getattr(record, "log_record", None)
+
+        if log_payload and isinstance(log_payload, LogRecord):
+            return self._format_structured(ts, style, badge, log_payload)
+
+        msg = record.getMessage()
+        # uvicorn startup messages — keep short
+        if record.name.startswith("uvicorn"):
+            return f"[dim]{ts}[/] [{style}]{badge}[/] {msg}"
+        return f"[dim]{ts}[/] [{style}]{badge}[/] {msg}"
+
+    def _format_structured(self, ts: str, style: str, badge: str, rec: "LogRecord") -> str:
+        event = rec.event
+        data = rec.data or {}
+        rid = f"[dim]#{rec.request_id[:8]}[/] " if rec.request_id else ""
+
+        if event == LogEvent.REQUEST_START.value:
+            client_m = data.get("client_model", "?")
+            target_m = data.get("target_model", "?")
+            stream = "⚡stream" if data.get("stream") else "sync"
+            tokens = data.get("estimated_input_tokens", "?")
+            return (
+                f"[dim]{ts}[/] [{style}]{badge}[/] {rid}"
+                f"[bold cyan]{client_m}[/] → [bold magenta]{target_m}[/] "
+                f"[dim]({stream}, ~{tokens} tok)[/]"
+            )
+
+        if event == LogEvent.REQUEST_COMPLETED.value:
+            dur = data.get("duration_ms", 0)
+            inp = data.get("input_tokens", 0)
+            out = data.get("output_tokens", 0)
+            stop = data.get("stop_reason", "")
+            dur_color = "green" if dur < 5000 else "yellow" if dur < 15000 else "red"
+            return (
+                f"[dim]{ts}[/] [{style}]{badge}[/] {rid}"
+                f"[{dur_color}]{dur:.0f}ms[/] "
+                f"[dim]in={inp} out={out} stop={stop}[/]"
+            )
+
+        if event == LogEvent.REQUEST_FAILURE.value:
+            err_type = data.get("error_type", "unknown")
+            dur = data.get("duration_ms", 0)
+            client_m = data.get("client_model", "")
+            from rich.markup import escape
+            model_info = f" \\[[bold]{escape(client_m)}[/]\\]" if client_m and client_m != "unknown" else ""
+            return (
+                f"[dim]{ts}[/] [{style}]{badge}[/] {rid}"
+                f"[bold red]FAIL{model_info}[/] {rec.message} "
+                f"[dim]({err_type}, {dur:.0f}ms)[/]"
+            )
+
+        if event == LogEvent.STREAM_INTERRUPTED.value:
+            return (
+                f"[dim]{ts}[/] [{style}]{badge}[/] {rid}"
+                f"[bold red]STREAM ERROR[/] {rec.message}"
+            )
+
+        if event == LogEvent.MODEL_SELECTION.value:
+            return (
+                f"[dim]{ts}[/] [{style}]{badge}[/] {rid}"
+                f"[yellow]⚠ {rec.message}[/]"
+            )
+
+        if event == LogEvent.TOKEN_COUNT.value:
+            count = data.get("token_count", "?")
+            model = data.get("model", "?")
+            return (
+                f"[dim]{ts}[/] [{style}]{badge}[/] {rid}"
+                f"[dim]tokens: {count} ({model})[/]"
+            )
+
+        if rec.error:
+            return (
+                f"[dim]{ts}[/] [{style}]{badge}[/] {rid}"
+                f"[red]{rec.error.name}: {rec.error.message}[/]"
+            )
+
+        # fallback: just show message
+        extra = ""
+        if data:
+            brief_keys = [k for k in data if k not in ("body", "response", "params")]
+            if brief_keys:
+                parts = [f"{k}={data[k]}" for k in brief_keys[:3]]
+                extra = f" [dim]({', '.join(parts)})[/]"
+        return f"[dim]{ts}[/] [{style}]{badge}[/] {rid}{rec.message}{extra}"
+
+
+class _RichHandler(logging.Handler):
+    """Emits pre-formatted Rich markup to the console."""
+    def __init__(self, formatter: logging.Formatter):
+        super().__init__()
+        self.setFormatter(formatter)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+            _log_console.print(msg)
+            if record.exc_info and record.exc_info[0] is not None:
+                import traceback
+                traceback.print_exception(*record.exc_info)
+        except Exception:
+            self.handleError(record)
+
+
+_pretty_handler = _RichHandler(PrettyConsoleFormatter())
 
 dictConfig(
     {
@@ -150,36 +296,24 @@ dictConfig(
         "disable_existing_loggers": False,
         "formatters": {
             "json": {"()": JSONFormatter},
-            "console_json": {"()": ConsoleJSONFormatter},
         },
-        "handlers": {
-            "default": {
-                "class": "logging.StreamHandler",
-                "formatter": "console_json",
-                "stream": "ext://sys.stdout",
-            },
-        },
+        "handlers": {},
         "loggers": {
-            "": {"handlers": ["default"], "level": "WARNING"},
+            "": {"handlers": [], "level": "WARNING"},
             settings.app_name: {
-                "handlers": ["default"],
+                "handlers": [],
                 "level": settings.log_level.upper(),
                 "propagate": False,
             },
-            "uvicorn": {"handlers": ["default"], "level": "INFO", "propagate": False},
-            "uvicorn.error": {
-                "handlers": ["default"],
-                "level": "INFO",
-                "propagate": False,
-            },
-            "uvicorn.access": {
-                "handlers": ["default"],
-                "level": "INFO",
-                "propagate": False,
-            },
+            "uvicorn": {"handlers": [], "level": "INFO", "propagate": False},
+            "uvicorn.error": {"handlers": [], "level": "INFO", "propagate": False},
+            "uvicorn.access": {"handlers": [], "level": "INFO", "propagate": False},
         },
     }
 )
+
+for _ln in [settings.app_name, "uvicorn", "uvicorn.error", "uvicorn.access"]:
+    logging.getLogger(_ln).addHandler(_pretty_handler)
 
 
 class LogEvent(enum.Enum):
@@ -277,7 +411,8 @@ def warning(record: LogRecord, exc: Optional[Exception] = None):
 
 def error(record: LogRecord, exc: Optional[Exception] = None):
     if exc:
-        _error_console.print_exception(show_locals=False, width=120)
+        import traceback
+        traceback.print_exc()
     _log(logging.ERROR, record, exc=exc)
 
 
@@ -1052,8 +1187,8 @@ def _get_anthropic_error_details_from_exc(
     provider_details: Optional[ProviderErrorMetadata] = None
 
     if isinstance(exc, openai.APIError):
-        error_message = exc.message or str(exc)
-        status_code = exc.status_code or 500
+        error_message = getattr(exc, "message", None) or str(exc)
+        status_code = getattr(exc, "status_code", None) or 500
         error_type = STATUS_CODE_ERROR_MAP.get(
             status_code, AnthropicErrorType.API_ERROR
         )
@@ -1457,6 +1592,7 @@ async def _log_and_return_error_response(
         "duration_ms": duration_ms,
         "error_type": anthropic_error_type.value,
         "client_ip": request.client.host if request.client else "unknown",
+        "client_model": getattr(request.state, "client_model", "unknown"),
     }
     if provider_details:
         log_data["provider_name"] = provider_details.provider_name
@@ -1476,6 +1612,18 @@ async def _log_and_return_error_response(
     )
 
 
+@app.get("/v1/models", tags=["API"], status_code=200)
+async def list_models(request: Request):
+    """Dummy endpoint to satisfy Claude Code's model checks."""
+    return JSONResponse(content={
+        "type": "list",
+        "data": [
+            {"type": "model", "id": "claude-sonnet-4-6", "display_name": "Sonnet 4.6", "created_at": "2024-01-01T00:00:00Z"},
+            {"type": "model", "id": "claude-opus-4-6", "display_name": "Opus 4.6", "created_at": "2024-01-01T00:00:00Z"},
+            {"type": "model", "id": "claude-haiku-4-5-20251001", "display_name": "Haiku 4.5", "created_at": "2024-01-01T00:00:00Z"}
+        ]
+    })
+
 @app.post("/v1/messages", response_model=None, tags=["API"], status_code=200)
 async def create_message_proxy(
     request: Request,
@@ -1488,14 +1636,14 @@ async def create_message_proxy(
     request.state.request_id = request_id
     request.state.start_time_monotonic = time.monotonic()
 
-    api_key = request.headers.get("x-api-key")
-    if proxy_config.proxy_api_key and api_key != proxy_config.proxy_api_key:
-        return _build_anthropic_error_response(
-            AnthropicErrorType.AUTHENTICATION, "Invalid API key", 401
-        )
-
     try:
         raw_body = await request.json()
+        client_model = raw_body.get("model", "unknown") if isinstance(raw_body, dict) else "unknown"
+        request.state.client_model = client_model
+        
+        body_str = json.dumps(raw_body, ensure_ascii=False)
+        print(f"\n[INCOMING CLAUDE CODE REQUEST] HEADERS: {dict(request.headers)}\nBODY: {format_log_body(body_str)}\n")
+
         debug(
             LogRecord(
                 LogEvent.ANTHROPIC_REQUEST.value,
@@ -1504,6 +1652,15 @@ async def create_message_proxy(
                 {"body": raw_body},
             )
         )
+        
+        api_key = request.headers.get("x-api-key")
+        if proxy_config.proxy_api_key and api_key != proxy_config.proxy_api_key:
+            return await _log_and_return_error_response(
+                request,
+                401,
+                AnthropicErrorType.AUTHENTICATION,
+                "Invalid API key",
+            )
 
         anthropic_request = MessagesRequest.model_validate(
             raw_body, context={"request_id": request_id}
@@ -1589,11 +1746,12 @@ async def create_message_proxy(
     if openai_tool_choice:
         openai_params["tool_choice"] = openai_tool_choice
     if anthropic_request.metadata and anthropic_request.metadata.get("user_id"):
-        openai_params["user"] = str(anthropic_request.metadata.get("user_id"))
+        user_id_str = str(anthropic_request.metadata.get("user_id"))
+        # openrouter rejects messages with 'user' longer than 128 characters
+        openai_params["user"] = user_id_str[:128]
 
-    # openrouter rejects messages with 'user' longer than 128 characters
-    if len(openai_params["user"]) > 128:
-        openai_params["user"] = openai_params["user"][:128]
+    if target_conn.provider:
+        openai_params["extra_body"] = {"provider": {"order": target_conn.provider}}
 
     debug(
         LogRecord(
@@ -1634,7 +1792,7 @@ async def create_message_proxy(
                     request_id,
                 )
             )
-            openai_response_obj = await openai_client.chat.completions.create(
+            openai_response_obj = await target_client.chat.completions.create(
                 **openai_params
             )
 
@@ -1819,7 +1977,25 @@ async def logging_middleware(
     return response
 
 
+def update_env_file() -> None:
+    """Updates the .env file with current proxy settings for Claude Code."""
+    try:
+        env_path = Path(os.path.dirname(__file__)).parent.parent / ".env"
+        proxy_url = f"http://{settings.host}:{settings.port}"
+        proxy_api_key = proxy_config.proxy_api_key or "proxy-key"
+        
+        # Resolve to absolute path for clear logging
+        abs_env_path = env_path.resolve()
+        
+        set_key(str(abs_env_path), "ANTHROPIC_BASE_URL", proxy_url)
+        set_key(str(abs_env_path), "ANTHROPIC_API_KEY", proxy_api_key)
+        
+        _console.print(f"[bold green]Updated {abs_env_path} with proxy variables.[/bold green]")
+    except Exception as e:
+        _error_console.print(f"[bold red]Environment Error:[/bold red] Failed to update .env: {e}")
+
 if __name__ == "__main__":
+    update_env_file()
     _console.print(
         r"""[bold blue]
            /$$                           /$$
@@ -1870,5 +2046,5 @@ if __name__ == "__main__":
         port=settings.port,
         reload=settings.reload,
         log_config=None,
-        access_log=False,
+        access_log=True,
     )
