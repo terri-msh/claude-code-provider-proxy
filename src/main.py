@@ -1876,6 +1876,232 @@ async def handle_anthropic_streaming_response_from_openai_stream(
                     request_id=request_id,
                     data=log_data,
                 )
+                            )
+
+
+async def handle_anthropic_streaming_from_raw_httpx(
+    httpx_response: httpx.Response,
+    original_anthropic_model_name: str,
+    estimated_input_tokens: int,
+    request_id: str,
+    start_time_mono: float,
+) -> AsyncGenerator[str, None]:
+    """
+    Consumes raw httpx SSE stream and yields Anthropic-compatible SSE events.
+    Extracts OpenRouter cost and cache tokens from raw chunks.
+    """
+
+    anthropic_message_id = f"msg_stream_{request_id}_{uuid.uuid4().hex[:8]}"
+    next_anthropic_block_idx = 0
+    text_block_anthropic_idx: Optional[int] = None
+    openai_tool_idx_to_anthropic_block_idx: Dict[int, int] = {}
+    tool_states: Dict[int, Dict[str, Any]] = {}
+    output_token_count = 0
+    final_anthropic_stop_reason: StopReasonType = None
+    cache_creation_input_tokens = 0
+    cache_read_input_tokens = 0
+
+    enc = get_token_encoder(original_anthropic_model_name, request_id)
+
+    openai_to_anthropic_stop_reason_map = {
+        "stop": "end_turn",
+        "length": "max_tokens",
+        "tool_calls": "tool_use",
+        "function_call": "tool_use",
+        "content_filter": "stop_sequence",
+        None: None,
+    }
+
+    stream_status_code = httpx_response.status_code
+    stream_final_message = "Streaming request completed successfully."
+    stream_log_event = LogEvent.REQUEST_COMPLETED.value
+
+    try:
+        msg_start = {
+            "type": "message_start",
+            "message": {
+                "id": anthropic_message_id,
+                "type": "message",
+                "role": "assistant",
+                "model": original_anthropic_model_name,
+                "content": [],
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {"input_tokens": estimated_input_tokens, "output_tokens": 0},
+            },
+        }
+        yield f"event: message_start\ndata: {json.dumps(msg_start)}\n\n"
+        yield f"event: ping\ndata: {json.dumps({'type': 'ping'})}\n\n"
+
+        async for line in httpx_response.aiter_lines():
+            if not line:
+                continue
+
+            chunk_data = _parse_sse_chunk(line)
+            if not chunk_data:
+                continue
+
+            cost, cache_write, cache_read = _extract_openrouter_usage(chunk_data)
+            if cost is not None:
+                _current_request_cost.set(cost)
+            if cache_write:
+                cache_creation_input_tokens = cache_write
+            if cache_read:
+                cache_read_input_tokens = cache_read
+
+            if chunk_data.get("choices"):
+                choices = chunk_data["choices"]
+                if not choices:
+                    continue
+
+                choice = choices[0]
+                delta = choice.get("delta", {})
+                finish_reason = choice.get("finish_reason")
+
+                content = delta.get("content")
+                if content:
+                    output_token_count += len(enc.encode(content))
+                    if text_block_anthropic_idx is None:
+                        text_block_anthropic_idx = next_anthropic_block_idx
+                        next_anthropic_block_idx += 1
+                    start_text_event = {
+                        "type": "content_block_start",
+                        "index": text_block_anthropic_idx,
+                        "content_block": {"type": "text", "text": ""},
+                    }
+                    yield f"event: content_block_start\ndata: {json.dumps(start_text_event)}\n\n"
+
+                    text_delta_event = {
+                        "type": "content_block_delta",
+                        "index": text_block_anthropic_idx,
+                        "delta": {"type": "text_delta", "text": content},
+                    }
+                    yield f"event: content_block_delta\ndata: {json.dumps(text_delta_event)}\n\n"
+
+                tool_calls = delta.get("tool_calls")
+                if tool_calls:
+                    for tool_call in tool_calls:
+                        tool_idx = tool_call.get("index", 0)
+                        if tool_idx not in openai_tool_idx_to_anthropic_block_idx:
+                            new_idx = next_anthropic_block_idx
+                            next_anthropic_block_idx += 1
+                            openai_tool_idx_to_anthropic_block_idx[tool_idx] = new_idx
+                            tool_states[tool_idx] = {"name": "", "args_str": ""}
+                            tool_start_event = {
+                                "type": "content_block_start",
+                                "index": new_idx,
+                                "content_block": {"type": "tool_use", "id": f"toolu_{tool_idx}", "name": "", "input": {}},
+                            }
+                            yield f"event: content_block_start\ndata: {json.dumps(tool_start_event)}\n\n"
+
+                        anthropic_idx = openai_tool_idx_to_anthropic_block_idx[tool_idx]
+                        tool_state = tool_states[tool_idx]
+                        name = tool_call.get("function", {}).get("name")
+                        args_str = tool_call.get("function", {}).get("arguments")
+
+                        if name:
+                            tool_state["name"] = name
+                            tool_start_event = {
+                                "type": "content_block_start",
+                                "index": anthropic_idx,
+                                "content_block": {"type": "tool_use", "id": f"toolu_{tool_idx}", "name": name, "input": {}},
+                            }
+                            yield f"event: content_block_start\ndata: {json.dumps(tool_start_event)}\n\n"
+                        if args_str:
+                            tool_state["args_str"] += args_str
+                            try:
+                                tool_state["args"] = json.loads(tool_state["args_str"])
+                                args_delta_event = {
+                                    "type": "content_block_delta",
+                                    "index": anthropic_idx,
+                                    "delta": {
+                                        "type": "input_json_delta",
+                                        "partial_json": json.dumps(tool_state["args"]),
+                                    },
+                                }
+                                yield f"event: content_block_delta\ndata: {json.dumps(args_delta_event)}\n\n"
+                            except json.JSONDecodeError:
+                                pass
+
+                if finish_reason:
+                    final_anthropic_stop_reason = openai_to_anthropic_stop_reason_map.get(finish_reason, "end_turn")
+
+            if line.strip() == "[DONE]":
+                break
+
+        if text_block_anthropic_idx is not None:
+            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': text_block_anthropic_idx})}\n\n"
+        for anthropic_idx in openai_tool_idx_to_anthropic_block_idx.values():
+            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': anthropic_idx})}\n\n"
+
+        usage_data = {
+            "input_tokens": estimated_input_tokens,
+            "output_tokens": output_token_count,
+        }
+        delta_event = {
+            "type": "message_delta",
+            "delta": {"stop_reason": final_anthropic_stop_reason},
+            "usage": usage_data,
+        }
+        yield f"event: message_delta\ndata: {json.dumps(delta_event)}\n\n"
+        yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
+
+    except Exception as e:
+        import traceback
+        traceback_str = traceback.format_exc()
+        error_type = "stream_processing_error"
+        final_anthropic_stop_reason = "error"
+        stream_final_message = f"Error during stream processing: {str(e)}"
+        stream_log_event = LogEvent.STREAM_INTERRUPTED.value
+        stream_status_code = httpx_response.status_code or 500
+
+        error(
+            LogRecord(
+                event=LogEvent.STREAM_INTERRUPTED.value,
+                message=stream_final_message,
+                request_id=request_id,
+                data={
+                    "error_type": error_type,
+                    "traceback": traceback_str,
+                },
+            ),
+            exc=e,
+        )
+        yield _format_anthropic_error_sse_event(error_type, str(e), None)
+
+    finally:
+        duration_ms = (time.monotonic() - start_time_mono) * 1000
+        log_data = {
+            "status_code": stream_status_code,
+            "duration_ms": duration_ms,
+            "input_tokens": estimated_input_tokens,
+            "output_tokens": output_token_count,
+            "stop_reason": final_anthropic_stop_reason,
+        }
+        cost = _current_request_cost.get()
+        if cost is not None:
+            log_data["cost"] = cost
+        if cache_creation_input_tokens or cache_read_input_tokens:
+            log_data["cache_creation_input_tokens"] = cache_creation_input_tokens
+            log_data["cache_read_input_tokens"] = cache_read_input_tokens
+
+        if stream_log_event == LogEvent.REQUEST_COMPLETED.value:
+            info(
+                LogRecord(
+                    event=stream_log_event,
+                    message=stream_final_message,
+                    request_id=request_id,
+                    data=log_data,
+                )
+            )
+        else:
+            error(
+                LogRecord(
+                    event=stream_log_event,
+                    message=stream_final_message,
+                    request_id=request_id,
+                    data=log_data,
+                )
             )
 
 
