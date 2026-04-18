@@ -2389,13 +2389,21 @@ async def create_message_proxy(
                 openai_params_copy = openai_params.copy()
                 openai_params_copy["stream"] = True
 
-                # Make request using httpx instead of OpenAI SDK for raw SSE access
+                # Build correct URL - base_url already includes /v1
+                endpoint_url = target_conn.base_url.rstrip('/') + '/chat/completions'
+
+                # Build headers - use OAuth token format or Bearer based on configuration
+                auth_header = "OAuth " if target_conn.api_key.startswith("y1") else "Bearer "
+                headers = {
+                    "Authorization": auth_header + target_conn.api_key,
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": settings.referer_url,
+                    "X-Title": settings.app_name,
+                }
+
                 httpx_response = await httpx_client.post(
-                    target_conn.base_url.rstrip('/') + '/v1/chat/completions',
-                    headers={
-                        "Authorization": f"Bearer {target_conn.api_key}",
-                        "Content-Type": "application/json",
-                    },
+                    endpoint_url,
+                    headers=headers,
                     json=openai_params_copy,
                     timeout=180.0,
                 )
