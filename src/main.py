@@ -2372,19 +2372,70 @@ async def create_message_proxy(
                     request_id,
                 )
             )
-            openai_stream_response = await target_client.chat.completions.create(
-                **openai_params
-            )
-            return StreamingResponse(
-                handle_anthropic_streaming_response_from_openai_stream(
-                    openai_stream_response,
-                    anthropic_request.model,
-                    estimated_input_tokens,
-                    request_id,
-                    request.state.start_time_monotonic,
-                ),
-                media_type="text/event-stream",
-            )
+            # Try raw httpx streaming for OpenRouter, fallback to OpenAI SDK
+            try:
+                # Get the underlying httpx client from OpenAI AsyncClient
+                openai_client_instance = target_client
+                if hasattr(openai_client_instance, '_client') and hasattr(openai_client_instance._client, 'client'):
+                    httpx_client = openai_client_instance._client.client
+                else:
+                    # Use a new httpx client as fallback
+                    httpx_client = httpx.AsyncClient(
+                        event_hooks={'request': [log_request_hook], 'response': [log_response_hook]},
+                        verify=False,
+                        timeout=180.0,
+                    )
+
+                openai_params_copy = openai_params.copy()
+                openai_params_copy["stream"] = True
+
+                # Make request using httpx instead of OpenAI SDK for raw SSE access
+                httpx_response = await httpx_client.post(
+                    target_conn.base_url.rstrip('/') + '/v1/chat/completions',
+                    headers={
+                        "Authorization": f"Bearer {target_conn.api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=openai_params_copy,
+                    timeout=180.0,
+                )
+
+                if httpx_response.status_code != 200:
+                    httpx_response.raise_for_status()
+
+                return StreamingResponse(
+                    handle_anthropic_streaming_from_raw_httpx(
+                        httpx_response,
+                        anthropic_request.model,
+                        estimated_input_tokens,
+                        request_id,
+                        request.state.start_time_monotonic,
+                    ),
+                    media_type="text/event-stream",
+                )
+
+            except Exception as e_httpx:
+                # Fallback to OpenAI SDK if raw httpx fails
+                debug(
+                    LogRecord(
+                        LogEvent.REQUEST_FAILURE.value,
+                        f"Raw httpx streaming failed, falling back to OpenAI SDK: {str(e_httpx)}",
+                        request_id,
+                    )
+                )
+                openai_stream_response = await target_client.chat.completions.create(
+                    **openai_params
+                )
+                return StreamingResponse(
+                    handle_anthropic_streaming_response_from_openai_stream(
+                        openai_stream_response,
+                        anthropic_request.model,
+                        estimated_input_tokens,
+                        request_id,
+                        request.state.start_time_monotonic,
+                    ),
+                    media_type="text/event-stream",
+                )
         else:
             debug(
                 LogRecord(
