@@ -17,6 +17,7 @@ from logging.config import dictConfig
 from pathlib import Path
 from typing import (Any, AsyncGenerator, Awaitable, Callable, Dict, List,
                     Literal, Optional, Tuple, Union, cast)
+import re
 
 import fastapi
 import openai
@@ -69,7 +70,6 @@ class Settings(BaseSettings):
     app_name: str = "AnthropicProxy"
     app_version: str = "0.2.0"
     log_level: str = "DEBUG"
-    log_file_path: Optional[str] = "log.jsonl"
     host: str = "127.0.0.1"
     port: int = 8080
     reload: bool = True
@@ -85,6 +85,49 @@ clients_pool: Dict[str, openai.AsyncClient] = {}
 import httpx
 
 VERBOSE_LOGGING = "--verbose" in sys.argv
+LOG_JSON = "--log-json" in sys.argv
+
+import contextvars
+_current_request_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("request_id", default=None)
+_current_request_cost: contextvars.ContextVar[Optional[float]] = contextvars.ContextVar("request_cost", default=None)
+
+_SSE_LINE_RE = re.compile(r"data: (\{.*\})$", re.MULTILINE)
+
+
+def _parse_sse_chunk(line: str) -> Optional[Dict[str, Any]]:
+    """Parse a single SSE data line into JSON dict. Returns None if not a data line."""
+    match = _SSE_LINE_RE.match(line.strip())
+    if not match:
+        return None
+    try:
+        return json.loads(match.group(1))
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
+def _extract_openrouter_usage(chunk: Dict[str, Any]) -> Tuple[Optional[float], int, int]:
+    """Extract cost, cache_create, cache_read from OpenRouter SSE chunk.
+
+    Returns: (cost, cache_create_tokens, cache_read_tokens)
+    """
+    cost = None
+    cache_create = 0
+    cache_read = 0
+
+    usage = chunk.get("usage")
+    if isinstance(usage, dict):
+        # Cost from usage object
+        cost_val = usage.get("cost")
+        if cost_val is not None:
+            cost = float(cost_val)
+
+        # Cache tokens from prompt_tokens_details
+        details = usage.get("prompt_tokens_details")
+        if isinstance(details, dict):
+            cache_read = details.get("cached_tokens", 0) or 0
+            cache_create = details.get("cache_write_tokens", 0) or 0
+
+    return cost, cache_create, cache_read
 
 def truncate_large_structures(obj):
     if isinstance(obj, dict):
@@ -118,6 +161,40 @@ def format_log_body(body_str: str) -> str:
             return f"{body_str[:200]}\n... [truncated] ...\n{body_str[-200:]}"
         return body_str
 
+_SECRET_HEADER_KEYS = {"authorization", "x-api-key", "api-key", "cookie", "set-cookie", "proxy-authorization"}
+
+def mask_secrets(headers: Dict[str, str]) -> Dict[str, str]:
+    """Masks sensitive header values, showing first 8 chars + ...XXX."""
+    masked = {}
+    for key, value in headers.items():
+        if key.lower() in _SECRET_HEADER_KEYS and len(value) > 8:
+            masked[key] = value[:8] + "...XXX"
+        elif key.lower() in _SECRET_HEADER_KEYS:
+            masked[key] = value + "...XXX"
+        else:
+            masked[key] = value
+    return masked
+
+def extract_last_user_prompt(body: Dict[str, Any], max_len: int = 80) -> str:
+    """Extracts the last user message content from an OpenAI-style request body."""
+    messages = body.get("messages", [])
+    last_user_content = ""
+    for msg in reversed(messages):
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                texts = [
+                    p.get("text", "") for p in content
+                    if isinstance(p, dict) and p.get("type") == "text"
+                ]
+                last_user_content = " ".join(texts)
+            elif isinstance(content, str):
+                last_user_content = content
+            break
+    if len(last_user_content) > max_len:
+        return last_user_content[:max_len - 3] + "..."
+    return last_user_content
+
 class YandexAuth(httpx.Auth):
     def __init__(self, token: str):
         self.token = token
@@ -127,21 +204,112 @@ class YandexAuth(httpx.Auth):
         yield request
 
 async def log_request_hook(request: httpx.Request):
-    body = request.read().decode("utf-8", errors="ignore") if request.stream else "stream"
-    print(f"\n[HTTPX OUTGOING] {request.method} {request.url}\nHEADERS: {dict(request.headers)}\nBODY: {format_log_body(body)}\n")
+    body_str = request.read().decode("utf-8", errors="ignore") if request.stream else ""
+    request_id = _current_request_id.get()
+
+    data: Dict[str, Any] = {
+        "method": request.method,
+        "url": str(request.url),
+    }
+
+    if body_str:
+        try:
+            parsed_body = json.loads(body_str)
+            data["target_model"] = parsed_body.get("model", "?")
+            data["stream"] = parsed_body.get("stream", False)
+            data["last_user_prompt"] = extract_last_user_prompt(parsed_body)
+        except (json.JSONDecodeError, AttributeError):
+            data["body_preview"] = body_str[:200] if body_str else ""
+
+    if VERBOSE_LOGGING:
+        try:
+            parsed_body = json.loads(body_str) if body_str else {}
+            data["headers"] = mask_secrets(dict(request.headers))
+            data["body"] = truncate_large_structures(parsed_body) if parsed_body else body_str
+        except (json.JSONDecodeError, AttributeError):
+            data["headers"] = mask_secrets(dict(request.headers))
+            data["body"] = body_str
+
+    debug(
+        LogRecord(
+            event=LogEvent.UPSTREAM_REQUEST.value,
+            message=f"PROXY→Provider {request.method} {data.get('target_model', '?')}",
+            request_id=request_id,
+            data=data,
+        )
+    )
 
 async def log_response_hook(response: httpx.Response):
+    request_id = _current_request_id.get() if response.request else None
     content_type = response.headers.get("content-type", "")
-    if "text/event-stream" in content_type:
-        print(f"\n[HTTPX INCOMING] {response.status_code} {response.url}\nHEADERS: {dict(response.headers)}\nBODY: <SSE stream>\n")
-        return
-        
-    try:
-        await response.aread()
-        body = response.text
-    except Exception:
-        body = "<could not read>"
-    print(f"\n[HTTPX INCOMING] {response.status_code} {response.url}\nHEADERS: {dict(response.headers)}\nBODY: {format_log_body(body)}\n")
+
+    data: Dict[str, Any] = {
+        "status_code": response.status_code,
+        "url": str(response.url),
+    }
+
+    # Try multiple cost header variants (OpenRouter uses different headers)
+    cost_header = (
+        response.headers.get("x-ratelimit-cost")
+        or response.headers.get("x-cost")
+        or response.headers.get("cost")
+    )
+    if cost_header:
+        try:
+            cost_val = float(cost_header)
+            data["cost"] = cost_val
+            _current_request_cost.set(cost_val)
+        except (ValueError, TypeError):
+            pass
+    # Debug: log all response headers to discover cost/cache headers
+    if VERBOSE_LOGGING:
+        debug(LogRecord(
+            event=LogEvent.UPSTREAM_RESPONSE.value,
+            message="Response headers dump",
+            request_id=request_id,
+            data={"all_headers": mask_secrets(dict(response.headers))},
+        ))
+
+    is_sse = "text/event-stream" in content_type
+    if is_sse:
+        data["body_type"] = "sse_stream"
+    else:
+        try:
+            await response.aread()
+            body_text = response.text
+            data["body_type"] = "json"
+            try:
+                parsed = json.loads(body_text)
+                usage = parsed.get("usage", {})
+                data["input_tokens"] = usage.get("prompt_tokens", 0)
+                data["output_tokens"] = usage.get("completion_tokens", 0)
+                # Extract cost from response body for non-streaming
+                response_cost = usage.get('cost')
+                if response_cost is not None:
+                    data["cost"] = float(response_cost)
+                    _current_request_cost.set(float(response_cost))
+            except (json.JSONDecodeError, AttributeError):
+                pass
+            data["body_preview"] = body_text[:500] if body_text else ""
+        except Exception:
+            data["body_type"] = "unreadable"
+
+    if VERBOSE_LOGGING:
+        data["headers"] = mask_secrets(dict(response.headers))
+        if not is_sse:
+            try:
+                data["body"] = format_log_body(body_text)
+            except Exception:
+                pass
+
+    debug(
+        LogRecord(
+            event=LogEvent.UPSTREAM_RESPONSE.value,
+            message=f"Provider→PROXY {response.status_code}",
+            request_id=request_id,
+            data=data,
+        )
+    )
 
 def load_proxy_config() -> None:
     global proxy_config, clients_pool
@@ -249,10 +417,17 @@ class PrettyConsoleFormatter(logging.Formatter):
             out = data.get("output_tokens", 0)
             stop = data.get("stop_reason", "")
             dur_color = "green" if dur < 5000 else "yellow" if dur < 15000 else "red"
+            cost = data.get("cost")
+            cost_str = f" [green]${cost:.4f}[/]" if cost else ""
+            cache_create = data.get("cache_creation_input_tokens", 0)
+            cache_read = data.get("cache_read_input_tokens", 0)
+            cache_str = ""
+            if cache_create or cache_read:
+                cache_str = f" [dim]cache_create={cache_create} cache_read={cache_read}[/]"
             return (
                 f"[dim]{ts}[/] [{style}]{badge}[/] {rid}"
                 f"[{dur_color}]{dur:.0f}ms[/] "
-                f"[dim]in={inp} out={out} stop={stop}[/]"
+                f"[dim]in={inp} out={out} stop={stop}[/]{cost_str}{cache_str}"
             )
 
         if event == LogEvent.REQUEST_FAILURE.value:
@@ -287,6 +462,54 @@ class PrettyConsoleFormatter(logging.Formatter):
                 f"[dim]tokens: {count} ({model})[/]"
             )
 
+        if event == LogEvent.ANTHROPIC_REQUEST.value:
+            client_m = data.get("client_model", "?")
+            base = (
+                f"[dim]{ts}[/] [{style}]{badge}[/] {rid}"
+                f"[bold cyan]Claude→Proxy[/] {client_m}"
+            )
+            if VERBOSE_LOGGING and (data.get("headers") or data.get("body") is not None):
+                return base + "\n" + self._format_verbose_panels(data)
+            return base
+
+        if event == LogEvent.UPSTREAM_REQUEST.value:
+            target_m = data.get("target_model", "?")
+            stream = "⚡stream" if data.get("stream") else "sync"
+            prompt = data.get("last_user_prompt", "")
+            prompt_display = f' [dim]"{prompt}"[/]' if prompt else ""
+            base = (
+                f"[dim]{ts}[/] [{style}]{badge}[/] {rid}"
+                f"[bold cyan]PROXY→Provider[/] {target_m} "
+                f"[dim]{stream}[/]{prompt_display}"
+            )
+            if VERBOSE_LOGGING and (data.get("headers") or data.get("body") is not None):
+                return base + "\n" + self._format_verbose_panels(data)
+            return base
+
+        if event == LogEvent.UPSTREAM_RESPONSE.value:
+            status = data.get("status_code", "?")
+            body_type = data.get("body_type", "")
+            cost = data.get("cost")
+            cost_str = f" [green]${cost:.4f}[/]" if cost else ""
+            if body_type == "sse_stream":
+                base = (
+                    f"[dim]{ts}[/] [{style}]{badge}[/] {rid}"
+                    f"[bold magenta]Provider→PROXY[/] {status} "
+                    f"[dim]<SSE stream>[/]{cost_str}"
+                )
+            else:
+                stop = data.get("stop_reason", "")
+                inp = data.get("input_tokens", 0)
+                out = data.get("output_tokens", 0)
+                base = (
+                    f"[dim]{ts}[/] [{style}]{badge}[/] {rid}"
+                    f"[bold magenta]Provider→PROXY[/] {status} {stop} "
+                    f"[dim]in={inp} out={out}[/]{cost_str}"
+                )
+            if VERBOSE_LOGGING and (data.get("headers") or data.get("body") is not None):
+                return base + "\n" + self._format_verbose_panels(data)
+            return base
+
         if rec.error:
             return (
                 f"[dim]{ts}[/] [{style}]{badge}[/] {rid}"
@@ -301,6 +524,33 @@ class PrettyConsoleFormatter(logging.Formatter):
                 parts = [f"{k}={data[k]}" for k in brief_keys[:3]]
                 extra = f" [dim]({', '.join(parts)})[/]"
         return f"[dim]{ts}[/] [{style}]{badge}[/] {rid}{rec.message}{extra}"
+
+    def _format_verbose_panels(self, data: Dict[str, Any]) -> str:
+        """Build Rich panel markup for headers and body in verbose mode."""
+        parts = []
+        headers = data.get("headers")
+        if headers:
+            header_lines = "\n".join(f"  {k}: {v}" for k, v in headers.items())
+            parts.append(
+                f"[dim]  ┌─ Headers ─────────────────────────────[/]\n"
+                f"{header_lines}\n"
+                f"[dim]  └──────────────────────────────────────[/]"
+            )
+        body = data.get("body")
+        if body is not None:
+            if isinstance(body, (dict, list)):
+                body_str = json.dumps(body, indent=2, ensure_ascii=False)
+            else:
+                body_str = str(body)
+            if len(body_str) > 2000:
+                body_str = body_str[:1800] + "\n... [truncated] ..."
+            body_lines = "\n".join(f"  {line}" for line in body_str.split("\n"))
+            parts.append(
+                f"[dim]  ┌─ Body ───────────────────────────────[/]\n"
+                f"{body_lines}\n"
+                f"[dim]  └──────────────────────────────────────[/]"
+            )
+        return "\n".join(parts)
 
 
 class _RichHandler(logging.Handler):
@@ -360,6 +610,8 @@ class LogEvent(enum.Enum):
     STREAMING_REQUEST = "streaming_request"
     STREAM_INTERRUPTED = "stream_interrupted"
     TOKEN_COUNT = "token_count"
+    UPSTREAM_REQUEST = "upstream_request"
+    UPSTREAM_RESPONSE = "upstream_response"
     TOKEN_ENCODER_LOAD_FAILED = "token_encoder_load_failed"
     SYSTEM_PROMPT_ADJUSTED = "system_prompt_adjusted"
     TOOL_INPUT_SERIALIZATION_FAILURE = "tool_input_serialization_failure"
@@ -397,17 +649,14 @@ class LogRecord:
 
 _logger = logging.getLogger(settings.app_name)
 
-if settings.log_file_path:
+if LOG_JSON:
     try:
-        log_dir = os.path.dirname(settings.log_file_path)
-        if log_dir:
-            os.makedirs(log_dir, exist_ok=True)
-        file_handler = logging.FileHandler(settings.log_file_path, mode="a")
+        file_handler = logging.FileHandler("log.jsonl", mode="a")
         file_handler.setFormatter(JSONFormatter())
         _logger.addHandler(file_handler)
     except Exception as e:
         _error_console.print(
-            f"Failed to configure file logging to {settings.log_file_path}: {e}"
+            f"Failed to configure JSON log file: {e}"
         )
 
 
@@ -1295,6 +1544,8 @@ async def handle_anthropic_streaming_response_from_openai_stream(
 
     output_token_count = 0
     final_anthropic_stop_reason: StopReasonType = None
+    cache_creation_input_tokens = 0
+    cache_read_input_tokens = 0
 
     enc = get_token_encoder(original_anthropic_model_name, request_id)
 
@@ -1312,6 +1563,29 @@ async def handle_anthropic_streaming_response_from_openai_stream(
     stream_log_event = LogEvent.REQUEST_COMPLETED.value
 
     try:
+        # Try to get raw SSE stream for cost/cache extraction (OpenRouter)
+        raw_sse_extracted = False
+        try:
+            # Access underlying httpx response if available
+            if hasattr(openai_stream, '_response') and hasattr(openai_stream._response, 'content'):
+                raw_content = openai_stream._response.content.decode('utf-8', errors='ignore')
+                raw_sse_extracted = True
+                if VERBOSE_LOGGING:
+                    debug(LogRecord(
+                        event=LogEvent.STREAMING_REQUEST.value,
+                        message="Raw SSE snapshot check",
+                        request_id=request_id,
+                        data={"raw_sse_available": True, "sample": raw_content[:2000] if raw_content else ""},
+                    ))
+        except Exception as e:
+            if VERBOSE_LOGGING:
+                debug(LogRecord(
+                    event=LogEvent.STREAMING_REQUEST.value,
+                    message="Could not access raw SSE stream",
+                    request_id=request_id,
+                    data={"error": str(e)},
+                ))
+
         message_start_event_data = {
             "type": "message_start",
             "message": {
@@ -1330,6 +1604,55 @@ async def handle_anthropic_streaming_response_from_openai_stream(
 
         async for chunk in openai_stream:
             if not chunk.choices:
+                # Extract cost and cache tokens from message_delta usage (OpenRouter)
+                if chunk.usage:
+                    # Debug: inspect chunk.usage structure
+                    if VERBOSE_LOGGING:
+                        debug(LogRecord(
+                            event=LogEvent.STREAMING_REQUEST.value,
+                            message="Chunk usage debug",
+                            request_id=request_id,
+                            data={
+                                "usage_type": type(chunk.usage).__name__,
+                                "usage_dict": chunk.usage.model_dump() if hasattr(chunk.usage, 'model_dump') else str(chunk.usage),
+                                "usage_attrs": {k: v for k, v in chunk.usage.__dict__.items() if not k.startswith('_')} if hasattr(chunk.usage, '__dict__') else None,
+                            },
+                        ))
+
+                    # Extract cost from chunk.usage (OpenRouter)
+                    if hasattr(chunk.usage, 'cost'):
+                        cost_value = getattr(chunk.usage, 'cost', None)
+                        if cost_value is not None:
+                            _current_request_cost.set(float(cost_value))
+
+                    # Extract cache tokens - OpenRouter uses prompt_tokens_details.cached_tokens and cache_write_tokens
+                    # Also try Anthropic-style names for compatibility
+                    cache_read = 0
+                    cache_write = 0
+
+                    # Try OpenRouter style first
+                    if hasattr(chunk.usage, 'prompt_tokens_details'):
+                        details = getattr(chunk.usage, 'prompt_tokens_details', None)
+                        if isinstance(details, dict):
+                            cache_read = details.get('cached_tokens', 0) or 0
+                            cache_write = details.get('cache_write_tokens', 0) or 0
+                        elif hasattr(details, 'cached_tokens') or hasattr(details, 'cache_write_tokens'):
+                            cache_read = getattr(details, 'cached_tokens', 0) or 0
+                            cache_write = getattr(details, 'cache_write_tokens', 0) or 0
+
+                    # Fallback to Anthropic-style names (if OpenRouter proxy provider uses them)
+                    if not cache_read and not cache_write:
+                        cache_write = getattr(chunk.usage, 'cache_creation_input_tokens', 0) or 0
+                        cache_read = getattr(chunk.usage, 'cache_read_input_tokens', 0) or 0
+
+                    # Direct attribute access as fallback
+                    if not cache_write and not cache_read and hasattr(chunk.usage, '__dict__'):
+                        dump_dict = chunk.usage.__dict__
+                        cache_write = dump_dict.get('cache_write_tokens', 0) or dump_dict.get('cache_creation_input_tokens', 0) or 0
+                        cache_read = dump_dict.get('cached_tokens', 0) or dump_dict.get('cache_read_input_tokens', 0) or 0
+
+                    cache_creation_input_tokens = cache_write
+                    cache_read_input_tokens = cache_read
                 continue
 
             delta = chunk.choices[0].delta
@@ -1522,6 +1845,20 @@ async def handle_anthropic_streaming_response_from_openai_stream(
             "output_tokens": output_token_count,
             "stop_reason": final_anthropic_stop_reason,
         }
+        cost = _current_request_cost.get()
+        # Debug: show if cost was captured
+        if VERBOSE_LOGGING and cost is None:
+            debug(LogRecord(
+                event=LogEvent.REQUEST_COMPLETED.value,
+                message="Cost not available from context var",
+                request_id=request_id,
+                data={"note": "cost header might not be in response headers or logging hook didn't capture it"},
+            ))
+        if cost is not None:
+            log_data["cost"] = cost
+        if cache_creation_input_tokens or cache_read_input_tokens:
+            log_data["cache_creation_input_tokens"] = cache_creation_input_tokens
+            log_data["cache_read_input_tokens"] = cache_read_input_tokens
         if stream_log_event == LogEvent.REQUEST_COMPLETED.value:
             info(
                 LogRecord(
@@ -1667,21 +2004,27 @@ async def create_message_proxy(
     request_id = str(uuid.uuid4())
     request.state.request_id = request_id
     request.state.start_time_monotonic = time.monotonic()
+    _current_request_id.set(request_id)
+    _current_request_cost.set(None)
 
     try:
         raw_body = await request.json()
         client_model = raw_body.get("model", "unknown") if isinstance(raw_body, dict) else "unknown"
         request.state.client_model = client_model
-        
-        body_str = json.dumps(raw_body, ensure_ascii=False)
-        print(f"\n[INCOMING CLAUDE CODE REQUEST] HEADERS: {dict(request.headers)}\nBODY: {format_log_body(body_str)}\n")
+
+        anthropic_request_data: Dict[str, Any] = {
+            "client_model": client_model,
+        }
+        if VERBOSE_LOGGING:
+            anthropic_request_data["headers"] = mask_secrets(dict(request.headers))
+            anthropic_request_data["body"] = raw_body
 
         debug(
             LogRecord(
                 LogEvent.ANTHROPIC_REQUEST.value,
                 "Received Anthropic request body",
                 request_id,
-                {"body": raw_body},
+                anthropic_request_data,
             )
         )
         
@@ -1841,18 +2184,50 @@ async def create_message_proxy(
                 openai_response_obj, anthropic_request.model, request_id=request_id
             )
             duration_ms = (time.monotonic() - request.state.start_time_monotonic) * 1000
+            non_stream_data = {
+                "status_code": 200,
+                "duration_ms": duration_ms,
+                "input_tokens": anthropic_response_obj.usage.input_tokens,
+                "output_tokens": anthropic_response_obj.usage.output_tokens,
+                "stop_reason": anthropic_response_obj.stop_reason,
+            }
+            cost = _current_request_cost.get()
+            if cost is not None:
+                non_stream_data["cost"] = cost
+            raw_usage = openai_response_obj.usage
+            if raw_usage:
+                # Try OpenRouter style first (prompt_tokens_details.cached_tokens, cache_write_tokens)
+                cache_create = 0
+                cache_read = 0
+                if hasattr(raw_usage, 'prompt_tokens_details'):
+                    details = getattr(raw_usage, 'prompt_tokens_details', None)
+                    if isinstance(details, dict):
+                        cache_read = details.get('cached_tokens', 0) or 0
+                        cache_create = details.get('cache_write_tokens', 0) or 0
+                    elif hasattr(details, 'cached_tokens') or hasattr(details, 'cache_write_tokens'):
+                        cache_read = getattr(details, 'cached_tokens', 0) or 0
+                        cache_create = getattr(details, 'cache_write_tokens', 0) or 0
+
+                # Fallback to Anthropic-style names
+                if not cache_create and not cache_read:
+                    cache_create = getattr(raw_usage, 'cache_creation_input_tokens', 0) or 0
+                    cache_read = getattr(raw_usage, 'cache_read_input_tokens', 0) or 0
+
+                # Direct attribute access as fallback
+                if not cache_create and not cache_read and hasattr(raw_usage, '__dict__'):
+                    dump_dict = raw_usage.__dict__
+                    cache_create = dump_dict.get('cache_write_tokens', 0) or dump_dict.get('cache_creation_input_tokens', 0) or 0
+                    cache_read = dump_dict.get('cached_tokens', 0) or dump_dict.get('cache_read_input_tokens', 0) or 0
+
+                if cache_create or cache_read:
+                    non_stream_data["cache_creation_input_tokens"] = cache_create
+                    non_stream_data["cache_read_input_tokens"] = cache_read
             info(
                 LogRecord(
                     event=LogEvent.REQUEST_COMPLETED.value,
                     message="Non-streaming request completed successfully",
                     request_id=request_id,
-                    data={
-                        "status_code": 200,
-                        "duration_ms": duration_ms,
-                        "input_tokens": anthropic_response_obj.usage.input_tokens,
-                        "output_tokens": anthropic_response_obj.usage.output_tokens,
-                        "stop_reason": anthropic_response_obj.stop_reason,
-                    },
+                    data=non_stream_data,
                 )
             )
             debug(
@@ -2055,8 +2430,8 @@ if __name__ == "__main__":
         (proxy_config.mappings.small_model, "green"),
         ("\n   Log Level     : ", "default"),
         (settings.log_level.upper(), "yellow"),
-        ("\n   Log File      : ", "default"),
-        (settings.log_file_path or "Disabled", "dim"),
+        ("\n   Log JSON      : ", "default"),
+        ("Enabled", "bold green") if LOG_JSON else ("Disabled", "dim"),
         ("\n   Listening on  : ", "default"),
         (f"http://{settings.host}:{settings.port}", "bold white"),
         ("\n   Reload        : ", "default"),
