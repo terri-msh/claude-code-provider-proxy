@@ -86,11 +86,21 @@ import httpx
 
 VERBOSE_LOGGING = "--verbose" in sys.argv
 
-def truncate_long_strings(obj):
+def truncate_large_structures(obj):
     if isinstance(obj, dict):
-        return {k: truncate_long_strings(v) for k, v in obj.items()}
+        new_obj = {}
+        for k, v in obj.items():
+            if k == "tools" and isinstance(v, list) and len(v) > 0:
+                new_obj[k] = f"[{len(v)} tools truncated...]"
+            elif k == "messages" and isinstance(v, list) and len(v) > 2:
+                new_obj[k] = [f"[{len(v) - 1} messages truncated...]"] + [truncate_large_structures(v[-1])]
+            else:
+                new_obj[k] = truncate_large_structures(v)
+        return new_obj
     elif isinstance(obj, list):
-        return [truncate_long_strings(v) for v in obj]
+        if len(obj) > 10:
+            return [truncate_large_structures(v) for v in obj[:3]] + [f"... [{len(obj)-6} items truncated] ..."] + [truncate_large_structures(v) for v in obj[-3:]]
+        return [truncate_large_structures(v) for v in obj]
     elif isinstance(obj, str):
         if len(obj) > 300:
             return f"... [truncated {len(obj)-200} chars] ...\n{obj[-200:]}"
@@ -101,7 +111,7 @@ def format_log_body(body_str: str) -> str:
     try:
         parsed = json.loads(body_str)
         if not VERBOSE_LOGGING:
-            parsed = truncate_long_strings(parsed)
+            parsed = truncate_large_structures(parsed)
         return json.dumps(parsed, indent=2, ensure_ascii=False)
     except Exception:
         if not VERBOSE_LOGGING and len(body_str) > 500:
@@ -121,6 +131,11 @@ async def log_request_hook(request: httpx.Request):
     print(f"\n[HTTPX OUTGOING] {request.method} {request.url}\nHEADERS: {dict(request.headers)}\nBODY: {format_log_body(body)}\n")
 
 async def log_response_hook(response: httpx.Response):
+    content_type = response.headers.get("content-type", "")
+    if "text/event-stream" in content_type:
+        print(f"\n[HTTPX INCOMING] {response.status_code} {response.url}\nHEADERS: {dict(response.headers)}\nBODY: <SSE stream>\n")
+        return
+        
     try:
         await response.aread()
         body = response.text
