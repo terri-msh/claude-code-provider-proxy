@@ -90,6 +90,7 @@ LOG_JSON = "--log-json" in sys.argv
 import contextvars
 _current_request_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("request_id", default=None)
 _current_request_cost: contextvars.ContextVar[Optional[float]] = contextvars.ContextVar("request_cost", default=None)
+_current_request_provider: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("request_provider", default=None)
 
 _SSE_LINE_RE = re.compile(r"data: (\{.*\})$", re.MULTILINE)
 
@@ -163,6 +164,22 @@ def format_log_body(body_str: str) -> str:
 
 _SECRET_HEADER_KEYS = {"authorization", "x-api-key", "api-key", "cookie", "set-cookie", "proxy-authorization"}
 
+def extract_cache_control_paths(obj: Any, current_path: str = "") -> List[str]:
+    """Recursively finds all paths to 'cache_control' keys."""
+    paths = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            new_path = f"{current_path}.{k}" if current_path else k
+            if k == "cache_control":
+                paths.append(current_path if current_path else "root")
+            else:
+                paths.extend(extract_cache_control_paths(v, new_path))
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            new_path = f"{current_path}[{i}]"
+            paths.extend(extract_cache_control_paths(v, new_path))
+    return paths
+
 def mask_secrets(headers: Dict[str, str]) -> Dict[str, str]:
     """Masks sensitive header values, showing first 8 chars + ...XXX."""
     masked = {}
@@ -218,6 +235,9 @@ async def log_request_hook(request: httpx.Request):
             data["target_model"] = parsed_body.get("model", "?")
             data["stream"] = parsed_body.get("stream", False)
             data["last_user_prompt"] = extract_last_user_prompt(parsed_body)
+            cache_paths = extract_cache_control_paths(parsed_body)
+            if cache_paths:
+                data["cache_breakpoints"] = cache_paths
         except (json.JSONDecodeError, AttributeError):
             data["body_preview"] = body_str[:200] if body_str else ""
 
@@ -247,6 +267,15 @@ async def log_response_hook(response: httpx.Response):
         "status_code": response.status_code,
         "url": str(response.url),
     }
+
+    # Try multiple provider header variants
+    provider_header = (
+        response.headers.get("x-provider-name")
+        or response.headers.get("x-provider")
+    )
+    if provider_header:
+        data["provider"] = provider_header
+        _current_request_provider.set(provider_header)
 
     # Try multiple cost header variants (OpenRouter uses different headers)
     cost_header = (
@@ -283,6 +312,11 @@ async def log_response_hook(response: httpx.Response):
                 usage = parsed.get("usage", {})
                 data["input_tokens"] = usage.get("prompt_tokens", 0)
                 data["output_tokens"] = usage.get("completion_tokens", 0)
+                # Extract provider from response body
+                provider_val = parsed.get("provider") or parsed.get("providerName")
+                if provider_val:
+                    data["provider"] = provider_val
+                    _current_request_provider.set(provider_val)
                 # Extract cost from response body for non-streaming
                 response_cost = usage.get('cost')
                 if response_cost is not None:
@@ -419,6 +453,8 @@ class PrettyConsoleFormatter(logging.Formatter):
             dur_color = "green" if dur < 5000 else "yellow" if dur < 15000 else "red"
             cost = data.get("cost")
             cost_str = f" [green]${cost:.4f}[/]" if cost else ""
+            provider = data.get("provider")
+            provider_str = f" [blue]prov={provider}[/]" if provider else ""
             cache_create = data.get("cache_creation_input_tokens", 0)
             cache_read = data.get("cache_read_input_tokens", 0)
             cache_str = ""
@@ -427,7 +463,7 @@ class PrettyConsoleFormatter(logging.Formatter):
             return (
                 f"[dim]{ts}[/] [{style}]{badge}[/] {rid}"
                 f"[{dur_color}]{dur:.0f}ms[/] "
-                f"[dim]in={inp} out={out} stop={stop}[/]{cost_str}{cache_str}"
+                f"[dim]in={inp} out={out} stop={stop}[/]{cost_str}{provider_str}{cache_str}"
             )
 
         if event == LogEvent.REQUEST_FAILURE.value:
@@ -464,9 +500,11 @@ class PrettyConsoleFormatter(logging.Formatter):
 
         if event == LogEvent.ANTHROPIC_REQUEST.value:
             client_m = data.get("client_model", "?")
+            cache_bps = data.get("cache_breakpoints")
+            cache_str = f" [cyan]cache_breakpoints={cache_bps}[/]" if cache_bps else ""
             base = (
                 f"[dim]{ts}[/] [{style}]{badge}[/] {rid}"
-                f"[bold cyan]Claude→Proxy[/] {client_m}"
+                f"[bold cyan]Claude→Proxy[/] {client_m}{cache_str}"
             )
             if VERBOSE_LOGGING and (data.get("headers") or data.get("body") is not None):
                 return base + "\n" + self._format_verbose_panels(data)
@@ -477,10 +515,12 @@ class PrettyConsoleFormatter(logging.Formatter):
             stream = "⚡stream" if data.get("stream") else "sync"
             prompt = data.get("last_user_prompt", "")
             prompt_display = f' [dim]"{prompt}"[/]' if prompt else ""
+            cache_bps = data.get("cache_breakpoints")
+            cache_str = f" [cyan]cache_breakpoints={cache_bps}[/]" if cache_bps else ""
             base = (
                 f"[dim]{ts}[/] [{style}]{badge}[/] {rid}"
                 f"[bold cyan]PROXY→Provider[/] {target_m} "
-                f"[dim]{stream}[/]{prompt_display}"
+                f"[dim]{stream}[/]{prompt_display}{cache_str}"
             )
             if VERBOSE_LOGGING and (data.get("headers") or data.get("body") is not None):
                 return base + "\n" + self._format_verbose_panels(data)
@@ -491,11 +531,13 @@ class PrettyConsoleFormatter(logging.Formatter):
             body_type = data.get("body_type", "")
             cost = data.get("cost")
             cost_str = f" [green]${cost:.4f}[/]" if cost else ""
+            provider = data.get("provider")
+            provider_str = f" [blue]prov={provider}[/]" if provider else ""
             if body_type == "sse_stream":
                 base = (
                     f"[dim]{ts}[/] [{style}]{badge}[/] {rid}"
                     f"[bold magenta]Provider→PROXY[/] {status} "
-                    f"[dim]<SSE stream>[/]{cost_str}"
+                    f"[dim]<SSE stream>[/]{cost_str}{provider_str}"
                 )
             else:
                 stop = data.get("stop_reason", "")
@@ -504,7 +546,7 @@ class PrettyConsoleFormatter(logging.Formatter):
                 base = (
                     f"[dim]{ts}[/] [{style}]{badge}[/] {rid}"
                     f"[bold magenta]Provider→PROXY[/] {status} {stop} "
-                    f"[dim]in={inp} out={out}[/]{cost_str}"
+                    f"[dim]in={inp} out={out}[/]{cost_str}{provider_str}"
                 )
             if VERBOSE_LOGGING and (data.get("headers") or data.get("body") is not None):
                 return base + "\n" + self._format_verbose_panels(data)
@@ -704,6 +746,7 @@ def critical(record: LogRecord, exc: Optional[Exception] = None):
 class ContentBlockText(BaseModel):
     type: Literal["text"]
     text: str
+    cache_control: Optional[Dict[str, Any]] = None
 
 
 class ContentBlockImageSource(BaseModel):
@@ -715,6 +758,7 @@ class ContentBlockImageSource(BaseModel):
 class ContentBlockImage(BaseModel):
     type: Literal["image"]
     source: ContentBlockImageSource
+    cache_control: Optional[Dict[str, Any]] = None
 
 
 class ContentBlockToolUse(BaseModel):
@@ -722,6 +766,7 @@ class ContentBlockToolUse(BaseModel):
     id: str
     name: str
     input: Dict[str, Any]
+    cache_control: Optional[Dict[str, Any]] = None
 
 
 class ContentBlockToolResult(BaseModel):
@@ -729,6 +774,7 @@ class ContentBlockToolResult(BaseModel):
     tool_use_id: str
     content: Union[str, List[Dict[str, Any]], List[Any]]
     is_error: Optional[bool] = None
+    cache_control: Optional[Dict[str, Any]] = None
 
 
 ContentBlock = Union[
@@ -739,6 +785,7 @@ ContentBlock = Union[
 class SystemContent(BaseModel):
     type: Literal["text"]
     text: str
+    cache_control: Optional[Dict[str, Any]] = None
 
 
 class Message(BaseModel):
@@ -750,6 +797,7 @@ class Tool(BaseModel):
     name: str
     description: Optional[str] = None
     input_schema: Dict[str, Any] = Field(..., alias="input_schema")
+    cache_control: Optional[Dict[str, Any]] = None
 
 
 class ToolChoice(BaseModel):
@@ -1107,16 +1155,19 @@ def convert_anthropic_to_openai_messages(
 ) -> List[Dict[str, Any]]:
     openai_messages: List[Dict[str, Any]] = []
 
-    system_text_content = ""
     if isinstance(anthropic_system, str):
-        system_text_content = anthropic_system
+        if anthropic_system:
+            openai_messages.append({"role": "system", "content": anthropic_system})
     elif isinstance(anthropic_system, list):
-        system_texts = [
-            block.text
-            for block in anthropic_system
-            if isinstance(block, SystemContent) and block.type == "text"
-        ]
-        if len(system_texts) < len(anthropic_system):
+        sys_parts = []
+        for block in anthropic_system:
+            if isinstance(block, SystemContent) and block.type == "text":
+                part: Dict[str, Any] = {"type": "text", "text": block.text}
+                if getattr(block, "cache_control", None):
+                    part["cache_control"] = block.cache_control
+                sys_parts.append(part)
+        
+        if len(sys_parts) < len(anthropic_system):
             warning(
                 LogRecord(
                     event=LogEvent.SYSTEM_PROMPT_ADJUSTED.value,
@@ -1124,10 +1175,14 @@ def convert_anthropic_to_openai_messages(
                     request_id=request_id,
                 )
             )
-        system_text_content = "\n".join(system_texts)
-
-    if system_text_content:
-        openai_messages.append({"role": "system", "content": system_text_content})
+            
+        if sys_parts:
+            has_cache = any("cache_control" in part for part in sys_parts)
+            if has_cache:
+                openai_messages.append({"role": "system", "content": sys_parts})
+            else:
+                system_text_content = "\n".join(part["text"] for part in sys_parts)
+                openai_messages.append({"role": "system", "content": system_text_content})
 
     for i, msg in enumerate(anthropic_messages):
         role = msg.role
@@ -1158,22 +1213,24 @@ def convert_anthropic_to_openai_messages(
 
                 if isinstance(block, ContentBlockText):
                     if role == "user":
-                        openai_parts_for_user_message.append(
-                            {"type": "text", "text": block.text}
-                        )
+                        openai_part: Dict[str, Any] = {"type": "text", "text": block.text}
+                        if getattr(block, "cache_control", None):
+                            openai_part["cache_control"] = block.cache_control
+                        openai_parts_for_user_message.append(openai_part)
                     elif role == "assistant":
                         text_content_for_assistant.append(block.text)
 
                 elif isinstance(block, ContentBlockImage) and role == "user":
                     if block.source.type == "base64":
-                        openai_parts_for_user_message.append(
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:{block.source.media_type};base64,{block.source.data}"
-                                },
-                            }
-                        )
+                        img_part: Dict[str, Any] = {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{block.source.media_type};base64,{block.source.data}"
+                            },
+                        }
+                        if getattr(block, "cache_control", None):
+                            img_part["cache_control"] = block.cache_control
+                        openai_parts_for_user_message.append(img_part)
                     else:
                         warning(
                             LogRecord(
@@ -1215,13 +1272,14 @@ def convert_anthropic_to_openai_messages(
                     serialized_content = _serialize_tool_result_content_for_openai(
                         block.content, request_id, block_log_ctx
                     )
-                    openai_messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": block.tool_use_id,
-                            "content": serialized_content,
-                        }
-                    )
+                    tool_msg: Dict[str, Any] = {
+                        "role": "tool",
+                        "tool_call_id": block.tool_use_id,
+                        "content": serialized_content,
+                    }
+                    if getattr(block, "cache_control", None):
+                        tool_msg["cache_control"] = block.cache_control
+                    openai_messages.append(tool_msg)
 
             if role == "user" and openai_parts_for_user_message:
                 is_multimodal = any(
@@ -1308,8 +1366,9 @@ def convert_anthropic_tools_to_openai(
 ) -> Optional[List[Dict[str, Any]]]:
     if not anthropic_tools:
         return None
-    return [
-        {
+    res = []
+    for t in anthropic_tools:
+        func = {
             "type": "function",
             "function": {
                 "name": t.name,
@@ -1317,8 +1376,10 @@ def convert_anthropic_tools_to_openai(
                 "parameters": t.input_schema,
             },
         }
-        for t in anthropic_tools
-    ]
+        if getattr(t, "cache_control", None):
+            func["cache_control"] = t.cache_control
+        res.append(func)
+    return res
 
 
 def convert_anthropic_tool_choice_to_openai(
@@ -1603,6 +1664,11 @@ async def handle_anthropic_streaming_response_from_openai_stream(
         yield f"event: ping\ndata: {json.dumps({'type': 'ping'})}\n\n"
 
         async for chunk in openai_stream:
+            # Extract provider
+            provider_val = getattr(chunk, "provider", None) or getattr(chunk, "model_extra", {}).get("provider")
+            if provider_val:
+                _current_request_provider.set(provider_val)
+
             if not chunk.choices:
                 # Extract cost and cache tokens from message_delta usage (OpenRouter)
                 if chunk.usage:
@@ -1846,6 +1912,9 @@ async def handle_anthropic_streaming_response_from_openai_stream(
             "stop_reason": final_anthropic_stop_reason,
         }
         cost = _current_request_cost.get()
+        provider_val = _current_request_provider.get()
+        if provider_val:
+            log_data["provider"] = provider_val
         # Debug: show if cost was captured
         if VERBOSE_LOGGING and cost is None:
             debug(LogRecord(
@@ -1881,6 +1950,7 @@ async def handle_anthropic_streaming_response_from_openai_stream(
 
 async def handle_anthropic_streaming_from_raw_httpx(
     httpx_response: httpx.Response,
+    httpx_client: httpx.AsyncClient,
     original_anthropic_model_name: str,
     estimated_input_tokens: int,
     request_id: str,
@@ -1916,6 +1986,16 @@ async def handle_anthropic_streaming_from_raw_httpx(
     stream_final_message = "Streaming request completed successfully."
     stream_log_event = LogEvent.REQUEST_COMPLETED.value
 
+    resp_data: Dict[str, Any] = {"status_code": stream_status_code, "body_type": "sse_stream"}
+    if VERBOSE_LOGGING:
+        resp_data["headers"] = mask_secrets(dict(httpx_response.headers))
+    debug(LogRecord(
+        event=LogEvent.UPSTREAM_RESPONSE.value,
+        message=f"Provider→PROXY {stream_status_code} <SSE stream>",
+        request_id=request_id,
+        data=resp_data,
+    ))
+
     try:
         msg_start = {
             "type": "message_start",
@@ -1940,6 +2020,10 @@ async def handle_anthropic_streaming_from_raw_httpx(
             chunk_data = _parse_sse_chunk(line)
             if not chunk_data:
                 continue
+
+            provider_val = chunk_data.get("provider") or chunk_data.get("providerName")
+            if provider_val:
+                _current_request_provider.set(provider_val)
 
             cost, cache_write, cache_read = _extract_openrouter_usage(chunk_data)
             if cost is not None:
@@ -2038,6 +2122,10 @@ async def handle_anthropic_streaming_from_raw_httpx(
             "input_tokens": estimated_input_tokens,
             "output_tokens": output_token_count,
         }
+        if cache_creation_input_tokens > 0:
+            usage_data["cache_creation_input_tokens"] = cache_creation_input_tokens
+        if cache_read_input_tokens > 0:
+            usage_data["cache_read_input_tokens"] = cache_read_input_tokens
         delta_event = {
             "type": "message_delta",
             "delta": {"stop_reason": final_anthropic_stop_reason},
@@ -2079,6 +2167,9 @@ async def handle_anthropic_streaming_from_raw_httpx(
             "stop_reason": final_anthropic_stop_reason,
         }
         cost = _current_request_cost.get()
+        provider_val = _current_request_provider.get()
+        if provider_val:
+            log_data["provider"] = provider_val
         if cost is not None:
             log_data["cost"] = cost
         if cache_creation_input_tokens or cache_read_input_tokens:
@@ -2103,6 +2194,10 @@ async def handle_anthropic_streaming_from_raw_httpx(
                     data=log_data,
                 )
             )
+
+        # Cleanup httpx resources
+        await httpx_response.aclose()
+        await httpx_client.aclose()
 
 
 app = fastapi.FastAPI(
@@ -2234,16 +2329,26 @@ async def create_message_proxy(
     _current_request_cost.set(None)
 
     try:
-        raw_body = await request.json()
-        client_model = raw_body.get("model", "unknown") if isinstance(raw_body, dict) else "unknown"
+        raw_body = await request.body()
+        raw_json = json.loads(raw_body)
+        client_model = raw_json.get("model", "unknown") if isinstance(raw_json, dict) else "unknown"
         request.state.client_model = client_model
 
         anthropic_request_data: Dict[str, Any] = {
             "client_model": client_model,
         }
         if VERBOSE_LOGGING:
+            anthropic_request_data["method"] = request.method
+            anthropic_request_data["url"] = str(request.url)
             anthropic_request_data["headers"] = mask_secrets(dict(request.headers))
-            anthropic_request_data["body"] = raw_body
+            try:
+                parsed_raw_body = json.loads(raw_body)
+                anthropic_request_data["body"] = parsed_raw_body
+                cache_paths = extract_cache_control_paths(parsed_raw_body)
+                if cache_paths:
+                    anthropic_request_data["cache_breakpoints"] = cache_paths
+            except Exception:
+                anthropic_request_data["body"] = raw_body
 
         debug(
             LogRecord(
@@ -2374,46 +2479,72 @@ async def create_message_proxy(
             )
             # Try raw httpx streaming for OpenRouter, fallback to OpenAI SDK
             try:
-                # Get the underlying httpx client from OpenAI AsyncClient
-                openai_client_instance = target_client
-                if hasattr(openai_client_instance, '_client') and hasattr(openai_client_instance._client, 'client'):
-                    httpx_client = openai_client_instance._client.client
-                else:
-                    # Use a new httpx client as fallback
-                    httpx_client = httpx.AsyncClient(
-                        event_hooks={'request': [log_request_hook], 'response': [log_response_hook]},
-                        verify=False,
-                        timeout=180.0,
-                    )
-
-                openai_params_copy = openai_params.copy()
-                openai_params_copy["stream"] = True
+                httpx_client = httpx.AsyncClient(
+                    verify=False,
+                    timeout=180.0,
+                )
 
                 # Build correct URL - base_url already includes /v1
                 endpoint_url = target_conn.base_url.rstrip('/') + '/chat/completions'
 
-                # Build headers - use OAuth token format or Bearer based on configuration
-                auth_header = "OAuth " if target_conn.api_key.startswith("y1") else "Bearer "
+                # api_key in config already contains auth scheme prefix ("OAuth ..." or "Bearer ...")
+                api_key = target_conn.api_key
+                if not api_key.startswith(("OAuth ", "Bearer ")):
+                    api_key = f"Bearer {api_key}"
                 headers = {
-                    "Authorization": auth_header + target_conn.api_key,
+                    "Authorization": api_key,
                     "Content-Type": "application/json",
                     "HTTP-Referer": settings.referer_url,
                     "X-Title": settings.app_name,
                 }
 
-                httpx_response = await httpx_client.post(
-                    endpoint_url,
-                    headers=headers,
-                    json=openai_params_copy,
-                    timeout=180.0,
-                )
+                # Build JSON body: merge extra_body (OpenAI SDK convention) into top-level
+                raw_body = {**openai_params, "stream": True}
+                extra_body = raw_body.pop("extra_body", None)
+                if extra_body and isinstance(extra_body, dict):
+                    raw_body.update(extra_body)
+
+                # Use send(stream=True) for true SSE streaming (post() buffers the whole response)
+                req = httpx_client.build_request("POST", endpoint_url, headers=headers, json=raw_body, timeout=180.0)
+
+                log_data: Dict[str, Any] = {
+                    "target_model": raw_body.get("model", "?"),
+                    "stream": True,
+                    "last_user_prompt": extract_last_user_prompt(raw_body),
+                }
+                if VERBOSE_LOGGING:
+                    log_data["headers"] = mask_secrets(dict(req.headers))
+                    log_data["body"] = truncate_large_structures(raw_body)
+                debug(LogRecord(
+                    event=LogEvent.UPSTREAM_REQUEST.value,
+                    message=f"PROXY→Provider {raw_body.get('model', '?')}",
+                    request_id=request_id,
+                    data=log_data,
+                ))
+
+                httpx_response = await httpx_client.send(req, stream=True)
 
                 if httpx_response.status_code != 200:
+                    await httpx_response.aread()
+                    error_body = httpx_response.text
+                    debug(LogRecord(
+                        event=LogEvent.UPSTREAM_RESPONSE.value,
+                        message=f"Provider→PROXY {httpx_response.status_code} ERROR",
+                        request_id=request_id,
+                        data={
+                            "status_code": httpx_response.status_code,
+                            "body": error_body[:500],
+                            "headers": mask_secrets(dict(httpx_response.headers)) if VERBOSE_LOGGING else None,
+                        },
+                    ))
+                    await httpx_response.aclose()
+                    await httpx_client.aclose()
                     httpx_response.raise_for_status()
 
                 return StreamingResponse(
                     handle_anthropic_streaming_from_raw_httpx(
                         httpx_response,
+                        httpx_client,
                         anthropic_request.model,
                         estimated_input_tokens,
                         request_id,
