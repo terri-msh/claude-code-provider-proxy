@@ -114,6 +114,54 @@ class _RequestMetrics:
 # Global summary tracker
 _summary_tracker: list[_RequestMetrics] = []
 
+def _print_summary() -> None:
+    """Print aggregated request metrics summary."""
+    if not _summary_tracker:
+        return
+
+    total = len(_summary_tracker)
+    total_cost = sum(r.cost or 0 for r in _summary_tracker)
+    avg_duration = sum(r.duration_ms for r in _summary_tracker) / total
+    total_in = sum(r.input_tokens for r in _summary_tracker)
+    total_out = sum(r.output_tokens for r in _summary_tracker)
+    total_cache = sum(r.cache_creation + r.cache_read for r in _summary_tracker)
+    total_tokens = total_in + total_out
+    cache_pct = (total_cache / total_tokens * 100) if total_tokens else 0
+
+    # Count providers
+    provider_counts: dict[str, int] = {}
+    for r in _summary_tracker:
+        if r.provider:
+            provider_counts[r.provider] = provider_counts.get(r.provider, 0) + 1
+    provider_str = ", ".join(f"[blue]{p}[/]×{c}" for p, c in sorted(provider_counts.items(), key=lambda x: -x[1]))
+
+    # Count models
+    model_counts: dict[str, int] = {}
+    for r in _summary_tracker:
+        if r.target_model:
+            model_counts[r.target_model] = model_counts.get(r.target_model, 0) + 1
+    model_str = ", ".join(f"[blue]{m}[/]×{c}" for m, c in sorted(model_counts.items(), key=lambda x: -x[1]))
+
+    # Duration color
+    dur_color = "green" if avg_duration < 5000 else "yellow" if avg_duration < 15000 else "red"
+    cache_style = "cyan" if cache_pct > 50 else "dim"
+
+    border = "[dim]───────────────────────────────────────────────[/]"
+    summary_line = (
+        f"[bold]SUMMARY[/]  {total} requests  "
+        f"[green]${total_cost:.4f}[/] total  "
+        f"avg [{dur_color}]{avg_duration/1000:.1f}s[/]  "
+        f"cache [{cache_style}]{cache_pct:.0f}%[/]"
+    )
+
+    _log_console.print(f"\n{border}\n{summary_line}")
+    if provider_str:
+        _log_console.print(f"  [bold]Providers:[/]\t    {provider_str}")
+    if model_str:
+        _log_console.print(f"  [bold]Models:[/]\t    {model_str}")
+    _log_console.print(f"  [bold]Tokens:[/]\t    in={total_in}  out={total_out}  total={total_tokens}")
+    _log_console.print(f"{border}\n")
+
 import contextvars
 _current_request_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("request_id", default=None)
 _current_request_cost: contextvars.ContextVar[Optional[float]] = contextvars.ContextVar("request_cost", default=None)
