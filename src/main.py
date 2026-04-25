@@ -514,12 +514,9 @@ class PrettyConsoleFormatter(logging.Formatter):
         if event == LogEvent.REQUEST_START.value:
             client_m = data.get("client_model", "?")
             target_m = data.get("target_model", "?")
-            stream = "⚡stream" if data.get("stream") else "sync"
-            tokens = data.get("estimated_input_tokens", "?")
             return (
                 f"[dim]{ts}[/] [{style}]{badge}[/] {rid}"
-                f"[bold cyan]{client_m}[/] → [bold magenta]{target_m}[/] "
-                f"[dim]({stream}, ~{tokens} tok)[/]"
+                f"[bold cyan]{client_m}[/] → [bold magenta]{target_m}[/]"
             )
 
         if event == LogEvent.REQUEST_COMPLETED.value:
@@ -529,18 +526,33 @@ class PrettyConsoleFormatter(logging.Formatter):
             stop = data.get("stop_reason", "")
             dur_color = "green" if dur < 5000 else "yellow" if dur < 15000 else "red"
             cost = data.get("cost")
-            cost_str = f" [green]${cost:.4f}[/]" if cost else ""
+            cost_str = f"[green]${cost:.4f}[/]  " if cost else ""
             provider = data.get("provider")
-            provider_str = f" [blue]prov={provider}[/]" if provider else ""
-            cache_create = data.get("cache_creation_input_tokens", 0)
-            cache_read = data.get("cache_read_input_tokens", 0)
+            provider_str = f"[blue]prov={provider}[/]  " if provider else ""
+
+            # Cache percentage
+            cache_create = data.get("cache_creation_input_tokens", 0) or 0
+            cache_read = data.get("cache_read_input_tokens", 0) or 0
+            total_input = inp if inp else 0
+            cache_pct = (cache_create + cache_read) / total_input * 100 if total_input else 0
+
             cache_str = ""
-            if cache_create or cache_read:
-                cache_str = f" [dim]cache_create={cache_create} cache_read={cache_read}[/]"
+            if cache_pct > 0:
+                cache_style = "cyan" if cache_pct > 50 else "dim"
+                cache_str = f"[{cache_style}]cache={cache_pct:.0f}%[/]  "
+
+            stop_str = f"stop={stop}" if stop else ""
+
+            parts = [f"[{dur_color}]{dur:.0f}ms[/]"]
+            if inp:
+                parts.append(f"[dim]in={inp}[/]")
+            if out:
+                parts.append(f"[dim]out={out}[/]")
+            parts_str = "  ".join(parts) + "  "
+
             return (
                 f"[dim]{ts}[/] [{style}]{badge}[/] {rid}"
-                f"[{dur_color}]{dur:.0f}ms[/] "
-                f"[dim]in={inp} out={out} stop={stop}[/]{cost_str}{provider_str}{cache_str}"
+                f"{parts_str}{cache_str}{cost_str}{provider_str}{stop_str}"
             )
 
         if event == LogEvent.REQUEST_FAILURE.value:
