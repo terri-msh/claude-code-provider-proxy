@@ -579,68 +579,6 @@ class PrettyConsoleFormatter(logging.Formatter):
                 f"[yellow]⚠ {rec.message}[/]"
             )
 
-        if event == LogEvent.TOKEN_COUNT.value:
-            count = data.get("token_count", "?")
-            model = data.get("model", "?")
-            return (
-                f"[dim]{ts}[/] [{style}]{badge}[/] {rid}"
-                f"[dim]tokens: {count} ({model})[/]"
-            )
-
-        if event == LogEvent.ANTHROPIC_REQUEST.value:
-            client_m = data.get("client_model", "?")
-            cache_bps = data.get("cache_breakpoints")
-            cache_str = f" [cyan]cache_breakpoints={cache_bps}[/]" if cache_bps else ""
-            base = (
-                f"[dim]{ts}[/] [{style}]{badge}[/] {rid}"
-                f"[bold cyan]Claude→Proxy[/] {client_m}{cache_str}"
-            )
-            if VERBOSE_LOGGING and (data.get("headers") or data.get("body") is not None):
-                return base + "\n" + self._format_verbose_panels(data)
-            return base
-
-        if event == LogEvent.UPSTREAM_REQUEST.value:
-            target_m = data.get("target_model", "?")
-            stream = "⚡stream" if data.get("stream") else "sync"
-            prompt = data.get("last_user_prompt", "")
-            prompt_display = f' [dim]"{prompt}"[/]' if prompt else ""
-            cache_bps = data.get("cache_breakpoints")
-            cache_str = f" [cyan]cache_breakpoints={cache_bps}[/]" if cache_bps else ""
-            base = (
-                f"[dim]{ts}[/] [{style}]{badge}[/] {rid}"
-                f"[bold cyan]PROXY→Provider[/] {target_m} "
-                f"[dim]{stream}[/]{prompt_display}{cache_str}"
-            )
-            if VERBOSE_LOGGING and (data.get("headers") or data.get("body") is not None):
-                return base + "\n" + self._format_verbose_panels(data)
-            return base
-
-        if event == LogEvent.UPSTREAM_RESPONSE.value:
-            status = data.get("status_code", "?")
-            body_type = data.get("body_type", "")
-            cost = data.get("cost")
-            cost_str = f" [green]${cost:.4f}[/]" if cost else ""
-            provider = data.get("provider")
-            provider_str = f" [blue]prov={provider}[/]" if provider else ""
-            if body_type == "sse_stream":
-                base = (
-                    f"[dim]{ts}[/] [{style}]{badge}[/] {rid}"
-                    f"[bold magenta]Provider→PROXY[/] {status} "
-                    f"[dim]<SSE stream>[/]{cost_str}{provider_str}"
-                )
-            else:
-                stop = data.get("stop_reason", "")
-                inp = data.get("input_tokens", 0)
-                out = data.get("output_tokens", 0)
-                base = (
-                    f"[dim]{ts}[/] [{style}]{badge}[/] {rid}"
-                    f"[bold magenta]Provider→PROXY[/] {status} {stop} "
-                    f"[dim]in={inp} out={out}[/]{cost_str}{provider_str}"
-                )
-            if VERBOSE_LOGGING and (data.get("headers") or data.get("body") is not None):
-                return base + "\n" + self._format_verbose_panels(data)
-            return base
-
         if rec.error:
             return (
                 f"[dim]{ts}[/] [{style}]{badge}[/] {rid}"
@@ -655,33 +593,6 @@ class PrettyConsoleFormatter(logging.Formatter):
                 parts = [f"{k}={data[k]}" for k in brief_keys[:3]]
                 extra = f" [dim]({', '.join(parts)})[/]"
         return f"[dim]{ts}[/] [{style}]{badge}[/] {rid}{rec.message}{extra}"
-
-    def _format_verbose_panels(self, data: Dict[str, Any]) -> str:
-        """Build Rich panel markup for headers and body in verbose mode."""
-        parts = []
-        headers = data.get("headers")
-        if headers:
-            header_lines = "\n".join(f"  {k}: {v}" for k, v in headers.items())
-            parts.append(
-                f"[dim]  ┌─ Headers ─────────────────────────────[/]\n"
-                f"{header_lines}\n"
-                f"[dim]  └──────────────────────────────────────[/]"
-            )
-        body = data.get("body")
-        if body is not None:
-            if isinstance(body, (dict, list)):
-                body_str = json.dumps(body, indent=2, ensure_ascii=False)
-            else:
-                body_str = str(body)
-            if len(body_str) > 2000:
-                body_str = body_str[:1800] + "\n... [truncated] ..."
-            body_lines = "\n".join(f"  {line}" for line in body_str.split("\n"))
-            parts.append(
-                f"[dim]  ┌─ Body ───────────────────────────────[/]\n"
-                f"{body_lines}\n"
-                f"[dim]  └──────────────────────────────────────[/]"
-            )
-        return "\n".join(parts)
 
 
 class _RichHandler(logging.Handler):
@@ -753,7 +664,6 @@ class LogEvent(enum.Enum):
     TOOL_CHOICE_UNSUPPORTED = "tool_choice_unsupported"
     TOOL_ARGS_TYPE_MISMATCH = "tool_args_type_mismatch"
     TOOL_ARGS_PARSE_FAILURE = "tool_args_parse_failure"
-    TOOL_ARGS_UNEXPECTED = "tool_args_unexpected"
     TOOL_ID_PLACEHOLDER = "tool_id_placeholder"
     TOOL_ID_UPDATED = "tool_id_updated"
     PARAMETER_UNSUPPORTED = "parameter_unsupported"
