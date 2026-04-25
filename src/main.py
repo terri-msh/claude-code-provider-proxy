@@ -3,6 +3,7 @@ Single-file FastAPI application to proxy Anthropic API requests to an OpenAI-com
 Handles request/response conversion, streaming, and dynamic model selection.
 """
 
+import argparse
 import dataclasses
 import enum
 import json
@@ -84,8 +85,34 @@ clients_pool: Dict[str, openai.AsyncClient] = {}
 
 import httpx
 
-VERBOSE_LOGGING = "--verbose" in sys.argv
-LOG_JSON = "--log-json" in sys.argv
+# CLI parsing
+_parser = argparse.ArgumentParser()
+_parser.add_argument("--verbose", action="store_true")
+_parser.add_argument("--log-json", action="store_true")
+_parser.add_argument("--summary-every", type=int, default=3, help="Print summary every N requests")
+_args, _remaining = _parser.parse_known_args()
+sys.argv = _remaining  # remove our flags so uvicorn doesn't complain
+
+VERBOSE_LOGGING = _args.verbose
+LOG_JSON = _args.log_json
+SUMMARY_EVERY = _args.summary_every
+
+@dataclasses.dataclass
+class _RequestMetrics:
+    """Tracks metrics for a single request, used in summary aggregation."""
+    request_id: str
+    duration_ms: float
+    input_tokens: int
+    output_tokens: int
+    cost: Optional[float]
+    provider: Optional[str]
+    target_model: Optional[str]
+    is_error: bool = False
+    cache_creation: int = 0
+    cache_read: int = 0
+
+# Global summary tracker
+_summary_tracker: list[_RequestMetrics] = []
 
 import contextvars
 _current_request_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("request_id", default=None)
