@@ -325,14 +325,15 @@ async def log_request_hook(request: httpx.Request):
             data["headers"] = mask_secrets(dict(request.headers))
             data["body"] = body_str
 
-    debug(
-        LogRecord(
-            event=LogEvent.UPSTREAM_REQUEST.value,
-            message=f"PROXY→Provider {request.method} {data.get('target_model', '?')}",
-            request_id=request_id,
-            data=data,
+    if VERBOSE_LOGGING:
+        debug(
+            LogRecord(
+                event=LogEvent.UPSTREAM_REQUEST.value,
+                message=f"PROXY→Provider {request.method} {data.get('target_model', '?')}",
+                request_id=request_id,
+                data=data,
+            )
         )
-    )
 
 async def log_response_hook(response: httpx.Response):
     request_id = _current_request_id.get() if response.request else None
@@ -411,14 +412,15 @@ async def log_response_hook(response: httpx.Response):
             except Exception:
                 pass
 
-    debug(
-        LogRecord(
-            event=LogEvent.UPSTREAM_RESPONSE.value,
-            message=f"Provider→PROXY {response.status_code}",
-            request_id=request_id,
-            data=data,
+    if VERBOSE_LOGGING:
+        debug(
+            LogRecord(
+                event=LogEvent.UPSTREAM_RESPONSE.value,
+                message=f"Provider→PROXY {response.status_code}",
+                request_id=request_id,
+                data=data,
+            )
         )
-    )
 
 def load_proxy_config() -> None:
     global proxy_config, clients_pool
@@ -1148,14 +1150,15 @@ def count_tokens_for_anthropic_request(
                         request_id=request_id,
                     )
                 )
-    debug(
-        LogRecord(
-            event=LogEvent.TOKEN_COUNT.value,
-            message=f"Estimated {total_tokens} input tokens for model {model_name}",
-            data={"model": model_name, "token_count": total_tokens},
-            request_id=request_id,
+    if VERBOSE_LOGGING:
+        debug(
+            LogRecord(
+                event=LogEvent.TOKEN_COUNT.value,
+                message=f"Estimated {total_tokens} input tokens for model {model_name}",
+                data={"model": model_name, "token_count": total_tokens},
+                request_id=request_id,
+            )
         )
-    )
     return total_tokens
 
 
@@ -1851,13 +1854,14 @@ async def handle_anthropic_streaming_response_from_openai_stream(
                     tool_state = tool_states[current_anthropic_tool_block_idx]
 
                     if tool_delta.id and tool_state["id"].startswith("tool_ph_"):
-                        debug(
-                            LogRecord(
-                                LogEvent.TOOL_ID_UPDATED.value,
-                                f"Updated placeholder Tool ID for Anthropic block {current_anthropic_tool_block_idx} to {tool_delta.id}",
-                                request_id,
+                        if VERBOSE_LOGGING:
+                            debug(
+                                LogRecord(
+                                    LogEvent.TOOL_ID_UPDATED.value,
+                                    f"Updated placeholder Tool ID for Anthropic block {current_anthropic_tool_block_idx} to {tool_delta.id}",
+                                    request_id,
+                                )
                             )
-                        )
                         tool_state["id"] = tool_delta.id
 
                     if tool_delta.function:
@@ -2064,12 +2068,13 @@ async def handle_anthropic_streaming_from_raw_httpx(
     resp_data: Dict[str, Any] = {"status_code": stream_status_code, "body_type": "sse_stream"}
     if VERBOSE_LOGGING:
         resp_data["headers"] = mask_secrets(dict(httpx_response.headers))
-    debug(LogRecord(
-        event=LogEvent.UPSTREAM_RESPONSE.value,
-        message=f"Provider→PROXY {stream_status_code} <SSE stream>",
-        request_id=request_id,
-        data=resp_data,
-    ))
+    if VERBOSE_LOGGING:
+        debug(LogRecord(
+            event=LogEvent.UPSTREAM_RESPONSE.value,
+            message=f"Provider→PROXY {stream_status_code} <SSE stream>",
+            request_id=request_id,
+            data=resp_data,
+        ))
 
     try:
         msg_start = {
@@ -2425,14 +2430,15 @@ async def create_message_proxy(
             except Exception:
                 anthropic_request_data["body"] = raw_body
 
-        debug(
-            LogRecord(
-                LogEvent.ANTHROPIC_REQUEST.value,
-                "Received Anthropic request body",
-                request_id,
-                anthropic_request_data,
+        if VERBOSE_LOGGING:
+            debug(
+                LogRecord(
+                    LogEvent.ANTHROPIC_REQUEST.value,
+                    "Received Anthropic request body",
+                    request_id,
+                    anthropic_request_data,
+                )
             )
-        )
         
         api_key = request.headers.get("x-api-key")
         if proxy_config.proxy_api_key and api_key != proxy_config.proxy_api_key:
@@ -2534,24 +2540,26 @@ async def create_message_proxy(
     if target_conn.provider:
         openai_params["extra_body"] = {"provider": {"order": target_conn.provider}}
 
-    debug(
-        LogRecord(
-            LogEvent.OPENAI_REQUEST.value,
-            "Prepared OpenAI request parameters",
-            request_id,
-            {"params": openai_params},
+    if VERBOSE_LOGGING:
+        debug(
+            LogRecord(
+                LogEvent.OPENAI_REQUEST.value,
+                "Prepared OpenAI request parameters",
+                request_id,
+                {"params": openai_params},
+            )
         )
-    )
 
     try:
         if is_stream:
-            debug(
-                LogRecord(
-                    LogEvent.STREAMING_REQUEST.value,
-                    "Initiating streaming request to OpenAI-compatible API",
-                    request_id,
+            if VERBOSE_LOGGING:
+                debug(
+                    LogRecord(
+                        LogEvent.STREAMING_REQUEST.value,
+                        "Initiating streaming request to OpenAI-compatible API",
+                        request_id,
+                    )
                 )
-            )
             # Try raw httpx streaming for OpenRouter, fallback to OpenAI SDK
             try:
                 httpx_client = httpx.AsyncClient(
@@ -2590,28 +2598,30 @@ async def create_message_proxy(
                 if VERBOSE_LOGGING:
                     log_data["headers"] = mask_secrets(dict(req.headers))
                     log_data["body"] = truncate_large_structures(raw_body)
-                debug(LogRecord(
-                    event=LogEvent.UPSTREAM_REQUEST.value,
-                    message=f"PROXY→Provider {raw_body.get('model', '?')}",
-                    request_id=request_id,
-                    data=log_data,
-                ))
+                if VERBOSE_LOGGING:
+                    debug(LogRecord(
+                        event=LogEvent.UPSTREAM_REQUEST.value,
+                        message=f"PROXY→Provider {raw_body.get('model', '?')}",
+                        request_id=request_id,
+                        data=log_data,
+                    ))
 
                 httpx_response = await httpx_client.send(req, stream=True)
 
                 if httpx_response.status_code != 200:
                     await httpx_response.aread()
                     error_body = httpx_response.text
-                    debug(LogRecord(
-                        event=LogEvent.UPSTREAM_RESPONSE.value,
-                        message=f"Provider→PROXY {httpx_response.status_code} ERROR",
-                        request_id=request_id,
-                        data={
-                            "status_code": httpx_response.status_code,
-                            "body": error_body[:500],
-                            "headers": mask_secrets(dict(httpx_response.headers)) if VERBOSE_LOGGING else None,
-                        },
-                    ))
+                    if VERBOSE_LOGGING:
+                        debug(LogRecord(
+                            event=LogEvent.UPSTREAM_RESPONSE.value,
+                            message=f"Provider→PROXY {httpx_response.status_code} ERROR",
+                            request_id=request_id,
+                            data={
+                                "status_code": httpx_response.status_code,
+                                "body": error_body[:500],
+                                "headers": mask_secrets(dict(httpx_response.headers)) if VERBOSE_LOGGING else None,
+                            },
+                        ))
                     await httpx_response.aclose()
                     await httpx_client.aclose()
                     httpx_response.raise_for_status()
@@ -2630,13 +2640,14 @@ async def create_message_proxy(
 
             except Exception as e_httpx:
                 # Fallback to OpenAI SDK if raw httpx fails
-                debug(
-                    LogRecord(
-                        LogEvent.REQUEST_FAILURE.value,
-                        f"Raw httpx streaming failed, falling back to OpenAI SDK: {str(e_httpx)}",
-                        request_id,
+                if VERBOSE_LOGGING:
+                    debug(
+                        LogRecord(
+                            LogEvent.REQUEST_FAILURE.value,
+                            f"Raw httpx streaming failed, falling back to OpenAI SDK: {str(e_httpx)}",
+                            request_id,
+                        )
                     )
-                )
                 openai_stream_response = await target_client.chat.completions.create(
                     **openai_params
                 )
@@ -2651,25 +2662,27 @@ async def create_message_proxy(
                     media_type="text/event-stream",
                 )
         else:
-            debug(
-                LogRecord(
-                    LogEvent.OPENAI_REQUEST.value,
-                    "Sending non-streaming request to OpenAI-compatible API",
-                    request_id,
+            if VERBOSE_LOGGING:
+                debug(
+                    LogRecord(
+                        LogEvent.OPENAI_REQUEST.value,
+                        "Sending non-streaming request to OpenAI-compatible API",
+                        request_id,
+                    )
                 )
-            )
             openai_response_obj = await target_client.chat.completions.create(
                 **openai_params
             )
 
-            debug(
-                LogRecord(
-                    LogEvent.OPENAI_RESPONSE.value,
-                    "Received OpenAI response",
-                    request_id,
-                    {"response": openai_response_obj.model_dump()},
+            if VERBOSE_LOGGING:
+                debug(
+                    LogRecord(
+                        LogEvent.OPENAI_RESPONSE.value,
+                        "Received OpenAI response",
+                        request_id,
+                        {"response": openai_response_obj.model_dump()},
+                    )
                 )
-            )
 
             anthropic_response_obj = convert_openai_to_anthropic_response(
                 openai_response_obj, anthropic_request.model, request_id=request_id
@@ -2721,14 +2734,15 @@ async def create_message_proxy(
                     data=non_stream_data,
                 )
             )
-            debug(
-                LogRecord(
-                    LogEvent.ANTHROPIC_RESPONSE.value,
-                    "Prepared Anthropic response",
-                    request_id,
-                    {"response": anthropic_response_obj.model_dump(exclude_unset=True)},
+            if VERBOSE_LOGGING:
+                debug(
+                    LogRecord(
+                        LogEvent.ANTHROPIC_RESPONSE.value,
+                        "Prepared Anthropic response",
+                        request_id,
+                        {"response": anthropic_response_obj.model_dump(exclude_unset=True)},
+                    )
                 )
-            )
             return JSONResponse(
                 content=anthropic_response_obj.model_dump(exclude_unset=True)
             )
@@ -2799,11 +2813,12 @@ async def count_tokens_endpoint(request: Request) -> TokenCountResponse:
 @app.get("/", include_in_schema=False, tags=["Health"])
 async def root_health_check() -> JSONResponse:
     """Basic health check and information endpoint."""
-    debug(
-        LogRecord(
-            event=LogEvent.HEALTH_CHECK.value, message="Root health check accessed"
+    if VERBOSE_LOGGING:
+        debug(
+            LogRecord(
+                event=LogEvent.HEALTH_CHECK.value, message="Root health check accessed"
+            )
         )
-    )
     return JSONResponse(
         {
             "proxy_name": settings.app_name,
