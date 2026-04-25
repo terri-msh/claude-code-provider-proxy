@@ -2019,6 +2019,19 @@ async def handle_anthropic_streaming_response_from_openai_stream(
         if cache_creation_input_tokens or cache_read_input_tokens:
             log_data["cache_creation_input_tokens"] = cache_creation_input_tokens
             log_data["cache_read_input_tokens"] = cache_read_input_tokens
+        _summary_tracker.append(_RequestMetrics(
+            request_id=request_id,
+            duration_ms=log_data.get("duration_ms", 0),
+            input_tokens=log_data.get("input_tokens", 0),
+            output_tokens=log_data.get("output_tokens", 0),
+            cost=log_data.get("cost"),
+            provider=log_data.get("provider"),
+            target_model=log_data.get("target_model"),
+            cache_creation=log_data.get("cache_creation_input_tokens", 0) or 0,
+            cache_read=log_data.get("cache_read_input_tokens", 0) or 0,
+        ))
+        if len(_summary_tracker) % SUMMARY_EVERY == 0:
+            _print_summary()
         if stream_log_event == LogEvent.REQUEST_COMPLETED.value:
             info(
                 LogRecord(
@@ -2267,6 +2280,20 @@ async def handle_anthropic_streaming_from_raw_httpx(
         if cache_creation_input_tokens or cache_read_input_tokens:
             log_data["cache_creation_input_tokens"] = cache_creation_input_tokens
             log_data["cache_read_input_tokens"] = cache_read_input_tokens
+
+        _summary_tracker.append(_RequestMetrics(
+            request_id=request_id,
+            duration_ms=log_data.get("duration_ms", 0),
+            input_tokens=log_data.get("input_tokens", 0),
+            output_tokens=log_data.get("output_tokens", 0),
+            cost=log_data.get("cost"),
+            provider=log_data.get("provider"),
+            target_model=log_data.get("target_model"),
+            cache_creation=log_data.get("cache_creation_input_tokens", 0) or 0,
+            cache_read=log_data.get("cache_read_input_tokens", 0) or 0,
+        ))
+        if len(_summary_tracker) % SUMMARY_EVERY == 0:
+            _print_summary()
 
         if stream_log_event == LogEvent.REQUEST_COMPLETED.value:
             info(
@@ -2738,6 +2765,23 @@ async def create_message_proxy(
                 if cache_create or cache_read:
                     non_stream_data["cache_creation_input_tokens"] = cache_create
                     non_stream_data["cache_read_input_tokens"] = cache_read
+            provider_val = _current_request_provider.get()
+            if provider_val:
+                non_stream_data["provider"] = provider_val
+            non_stream_data["target_model"] = target_model_name
+            _summary_tracker.append(_RequestMetrics(
+                request_id=request_id,
+                duration_ms=non_stream_data.get("duration_ms", 0),
+                input_tokens=non_stream_data.get("input_tokens", 0),
+                output_tokens=non_stream_data.get("output_tokens", 0),
+                cost=non_stream_data.get("cost"),
+                provider=non_stream_data.get("provider"),
+                target_model=non_stream_data.get("target_model"),
+                cache_creation=non_stream_data.get("cache_creation_input_tokens", 0) or 0,
+                cache_read=non_stream_data.get("cache_read_input_tokens", 0) or 0,
+            ))
+            if len(_summary_tracker) % SUMMARY_EVERY == 0:
+                _print_summary()
             info(
                 LogRecord(
                     event=LogEvent.REQUEST_COMPLETED.value,
