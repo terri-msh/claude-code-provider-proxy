@@ -325,16 +325,6 @@ async def log_request_hook(request: httpx.Request):
             data["headers"] = mask_secrets(dict(request.headers))
             data["body"] = body_str
 
-    if VERBOSE_LOGGING:
-        debug(
-            LogRecord(
-                event=LogEvent.UPSTREAM_REQUEST.value,
-                message=f"PROXY→Provider {request.method} {data.get('target_model', '?')}",
-                request_id=request_id,
-                data=data,
-            )
-        )
-
 async def log_response_hook(response: httpx.Response):
     request_id = _current_request_id.get() if response.request else None
     content_type = response.headers.get("content-type", "")
@@ -366,14 +356,6 @@ async def log_response_hook(response: httpx.Response):
             _current_request_cost.set(cost_val)
         except (ValueError, TypeError):
             pass
-    # Debug: log all response headers to discover cost/cache headers
-    if VERBOSE_LOGGING:
-        debug(LogRecord(
-            event=LogEvent.UPSTREAM_RESPONSE.value,
-            message="Response headers dump",
-            request_id=request_id,
-            data={"all_headers": mask_secrets(dict(response.headers))},
-        ))
 
     is_sse = "text/event-stream" in content_type
     if is_sse:
@@ -411,16 +393,6 @@ async def log_response_hook(response: httpx.Response):
                 data["body"] = format_log_body(body_text)
             except Exception:
                 pass
-
-    if VERBOSE_LOGGING:
-        debug(
-            LogRecord(
-                event=LogEvent.UPSTREAM_RESPONSE.value,
-                message=f"Provider→PROXY {response.status_code}",
-                request_id=request_id,
-                data=data,
-            )
-        )
 
 def load_proxy_config() -> None:
     global proxy_config, clients_pool
@@ -645,30 +617,11 @@ class LogEvent(enum.Enum):
     REQUEST_START = "request_start"
     REQUEST_COMPLETED = "request_completed"
     REQUEST_FAILURE = "request_failure"
-    ANTHROPIC_REQUEST = "anthropic_body"
-    OPENAI_REQUEST = "openai_request"
-    OPENAI_RESPONSE = "openai_response"
-    ANTHROPIC_RESPONSE = "anthropic_response"
-    STREAMING_REQUEST = "streaming_request"
     STREAM_INTERRUPTED = "stream_interrupted"
-    TOKEN_COUNT = "token_count"
-    UPSTREAM_REQUEST = "upstream_request"
-    UPSTREAM_RESPONSE = "upstream_response"
     TOKEN_ENCODER_LOAD_FAILED = "token_encoder_load_failed"
-    SYSTEM_PROMPT_ADJUSTED = "system_prompt_adjusted"
     TOOL_INPUT_SERIALIZATION_FAILURE = "tool_input_serialization_failure"
-    IMAGE_FORMAT_UNSUPPORTED = "image_format_unsupported"
-    MESSAGE_FORMAT_NORMALIZED = "message_format_normalized"
     TOOL_RESULT_SERIALIZATION_FAILURE = "tool_result_serialization_failure"
-    TOOL_RESULT_PROCESSING = "tool_result_processing"
-    TOOL_CHOICE_UNSUPPORTED = "tool_choice_unsupported"
-    TOOL_ARGS_TYPE_MISMATCH = "tool_args_type_mismatch"
     TOOL_ARGS_PARSE_FAILURE = "tool_args_parse_failure"
-    TOOL_ID_PLACEHOLDER = "tool_id_placeholder"
-    TOOL_ID_UPDATED = "tool_id_updated"
-    PARAMETER_UNSUPPORTED = "parameter_unsupported"
-    HEALTH_CHECK = "health_check"
-    PROVIDER_ERROR_DETAILS = "provider_error_details"
 
 
 @dataclasses.dataclass
@@ -820,16 +773,6 @@ class MessagesRequest(BaseModel):
 
     @field_validator("top_k")
     def check_top_k(cls, v: Optional[int]) -> Optional[int]:
-        if v is not None:
-            req_id = info.context.get("request_id") if info.context else None
-            warning(
-                LogRecord(
-                    event=LogEvent.PARAMETER_UNSUPPORTED.value,
-                    message="Parameter 'top_k' provided by client but is not directly supported by the OpenAI Chat Completions API and will be ignored.",
-                    request_id=req_id,
-                    data={"parameter": "top_k", "value": v},
-                )
-            )
         return v
 
 
@@ -925,12 +868,6 @@ def extract_provider_error_details(
         try:
             parsed_raw_error = json.loads(raw_error_str)
         except json.JSONDecodeError:
-            warning(
-                LogRecord(
-                    event=LogEvent.PROVIDER_ERROR_DETAILS.value,
-                    message=f"Failed to parse raw provider error string for {provider_name}.",
-                )
-            )
             parsed_raw_error = {"raw_string_parse_failed": raw_error_str}
     elif isinstance(raw_error_str, dict):
         parsed_raw_error = raw_error_str
@@ -1020,14 +957,15 @@ def count_tokens_for_anthropic_request(
                         input_str = json.dumps(block.input)
                         total_tokens += len(enc.encode(input_str))
                     except Exception:
-                        warning(
-                            LogRecord(
-                                event=LogEvent.TOOL_INPUT_SERIALIZATION_FAILURE.value,
-                                message="Failed to serialize tool input for token counting.",
-                                data={"tool_name": block.name},
-                                request_id=request_id,
+                        if VERBOSE_LOGGING:
+                            warning(
+                                LogRecord(
+                                    event=LogEvent.TOOL_INPUT_SERIALIZATION_FAILURE.value,
+                                    message="Failed to serialize tool input for token counting.",
+                                    data={"tool_name": block.name},
+                                    request_id=request_id,
+                                )
                             )
-                        )
                 elif isinstance(block, ContentBlockToolResult):
                     try:
                         content_str = ""
@@ -1046,13 +984,14 @@ def count_tokens_for_anthropic_request(
                             content_str = json.dumps(block.content)
                         total_tokens += len(enc.encode(content_str))
                     except Exception:
-                        warning(
-                            LogRecord(
-                                event=LogEvent.TOOL_RESULT_SERIALIZATION_FAILURE.value,
-                                message="Failed to serialize tool result for token counting.",
-                                request_id=request_id,
+                        if VERBOSE_LOGGING:
+                            warning(
+                                LogRecord(
+                                    event=LogEvent.TOOL_RESULT_SERIALIZATION_FAILURE.value,
+                                    message="Failed to serialize tool result for token counting.",
+                                    request_id=request_id,
+                                )
                             )
-                        )
 
     if tools:
         total_tokens += 2
@@ -1064,23 +1003,15 @@ def count_tokens_for_anthropic_request(
                 schema_str = json.dumps(tool.input_schema)
                 total_tokens += len(enc.encode(schema_str))
             except Exception:
-                warning(
-                    LogRecord(
-                        event=LogEvent.TOOL_INPUT_SERIALIZATION_FAILURE.value,
-                        message="Failed to serialize tool schema for token counting.",
-                        data={"tool_name": tool.name},
-                        request_id=request_id,
+                if VERBOSE_LOGGING:
+                    warning(
+                        LogRecord(
+                            event=LogEvent.TOOL_INPUT_SERIALIZATION_FAILURE.value,
+                            message="Failed to serialize tool schema for token counting.",
+                            data={"tool_name": tool.name},
+                            request_id=request_id,
+                        )
                     )
-                )
-    if VERBOSE_LOGGING:
-        debug(
-            LogRecord(
-                event=LogEvent.TOKEN_COUNT.value,
-                message=f"Estimated {total_tokens} input tokens for model {model_name}",
-                data={"model": model_name, "token_count": total_tokens},
-                request_id=request_id,
-            )
-        )
     return total_tokens
 
 
@@ -1118,28 +1049,20 @@ def _serialize_tool_result_content_for_openai(
                     contains_non_text_block = True
 
         result_str = "\n".join(processed_parts)
-        if contains_non_text_block:
-            warning(
-                LogRecord(
-                    event=LogEvent.TOOL_RESULT_PROCESSING.value,
-                    message="Tool result content list contained non-text or complex items; parts were JSON stringified.",
-                    request_id=request_id,
-                    data={**log_context, "result_str_preview": result_str[:100]},
-                )
-            )
         return result_str
 
     try:
         return json.dumps(anthropic_tool_result_content)
     except TypeError as e:
-        warning(
-            LogRecord(
-                event=LogEvent.TOOL_RESULT_SERIALIZATION_FAILURE.value,
-                message=f"Failed to serialize tool result content to JSON: {e}. Returning error JSON.",
-                request_id=request_id,
-                data=log_context,
+        if VERBOSE_LOGGING:
+            warning(
+                LogRecord(
+                    event=LogEvent.TOOL_RESULT_SERIALIZATION_FAILURE.value,
+                    message=f"Failed to serialize tool result content to JSON: {e}. Returning error JSON.",
+                    request_id=request_id,
+                    data=log_context,
+                )
             )
-        )
         return json.dumps(
             {
                 "error": "Serialization failed",
@@ -1166,16 +1089,7 @@ def convert_anthropic_to_openai_messages(
                 if getattr(block, "cache_control", None):
                     part["cache_control"] = block.cache_control
                 sys_parts.append(part)
-        
-        if len(sys_parts) < len(anthropic_system):
-            warning(
-                LogRecord(
-                    event=LogEvent.SYSTEM_PROMPT_ADJUSTED.value,
-                    message="Non-text content blocks in Anthropic system prompt were ignored.",
-                    request_id=request_id,
-                )
-            )
-            
+
         if sys_parts:
             has_cache = any("cache_control" in part for part in sys_parts)
             if has_cache:
@@ -1231,15 +1145,6 @@ def convert_anthropic_to_openai_messages(
                         if getattr(block, "cache_control", None):
                             img_part["cache_control"] = block.cache_control
                         openai_parts_for_user_message.append(img_part)
-                    else:
-                        warning(
-                            LogRecord(
-                                event=LogEvent.IMAGE_FORMAT_UNSUPPORTED.value,
-                                message=f"Image block with source type '{block.source.type}' (expected 'base64') ignored in user message {i}.",
-                                request_id=request_id,
-                                data=block_log_ctx,
-                            )
-                        )
 
                 elif isinstance(block, ContentBlockToolUse) and role == "assistant":
                     try:
@@ -1347,14 +1252,6 @@ def convert_anthropic_to_openai_messages(
             and msg_dict.get("tool_calls")
             and msg_dict.get("content") is not None
         ):
-            warning(
-                LogRecord(
-                    event=LogEvent.MESSAGE_FORMAT_NORMALIZED.value,
-                    message="Corrected assistant message with tool_calls to have content: None.",
-                    request_id=request_id,
-                    data={"original_content": msg_dict["content"]},
-                )
-            )
             msg_dict["content"] = None
         final_openai_messages.append(msg_dict)
 
@@ -1391,26 +1288,10 @@ def convert_anthropic_tool_choice_to_openai(
     if anthropic_choice.type == "auto":
         return "auto"
     if anthropic_choice.type == "any":
-        warning(
-            LogRecord(
-                event=LogEvent.TOOL_CHOICE_UNSUPPORTED.value,
-                message="Anthropic tool_choice type 'any' mapped to OpenAI 'auto'. Exact behavior might differ (OpenAI 'auto' allows no tool use).",
-                request_id=request_id,
-                data={"anthropic_tool_choice": anthropic_choice.model_dump()},
-            )
-        )
         return "auto"
     if anthropic_choice.type == "tool" and anthropic_choice.name:
         return {"type": "function", "function": {"name": anthropic_choice.name}}
 
-    warning(
-        LogRecord(
-            event=LogEvent.TOOL_CHOICE_UNSUPPORTED.value,
-            message=f"Unsupported Anthropic tool_choice: {anthropic_choice.model_dump()}. Defaulting to 'auto'.",
-            request_id=request_id,
-            data={"anthropic_tool_choice": anthropic_choice.model_dump()},
-        )
-    )
     return "auto"
 
 
@@ -1453,17 +1334,6 @@ def convert_openai_to_anthropic_response(
                             tool_input_dict = parsed_input
                         else:
                             tool_input_dict = {"value": parsed_input}
-                            warning(
-                                LogRecord(
-                                    event=LogEvent.TOOL_ARGS_TYPE_MISMATCH.value,
-                                    message=f"OpenAI tool arguments for '{call.function.name}' parsed to non-dict type '{type(parsed_input).__name__}'. Wrapped in 'value'.",
-                                    request_id=request_id,
-                                    data={
-                                        "tool_name": call.function.name,
-                                        "tool_id": call.id,
-                                    },
-                                )
-                            )
                     except json.JSONDecodeError as e:
                         error(
                             LogRecord(
@@ -1586,6 +1456,7 @@ async def handle_anthropic_streaming_response_from_openai_stream(
     estimated_input_tokens: int,
     request_id: str,
     start_time_mono: float,
+    target_model_name: str = "",
 ) -> AsyncGenerator[str, None]:
     """
     Consumes an OpenAI stream and yields Anthropic-compatible SSE events.
@@ -1620,7 +1491,7 @@ async def handle_anthropic_streaming_response_from_openai_stream(
     }
 
     stream_status_code = 200
-    stream_final_message = "Streaming request completed successfully."
+    stream_final_message = ""
     stream_log_event = LogEvent.REQUEST_COMPLETED.value
 
     try:
@@ -1631,21 +1502,8 @@ async def handle_anthropic_streaming_response_from_openai_stream(
             if hasattr(openai_stream, '_response') and hasattr(openai_stream._response, 'content'):
                 raw_content = openai_stream._response.content.decode('utf-8', errors='ignore')
                 raw_sse_extracted = True
-                if VERBOSE_LOGGING:
-                    debug(LogRecord(
-                        event=LogEvent.STREAMING_REQUEST.value,
-                        message="Raw SSE snapshot check",
-                        request_id=request_id,
-                        data={"raw_sse_available": True, "sample": raw_content[:2000] if raw_content else ""},
-                    ))
         except Exception as e:
-            if VERBOSE_LOGGING:
-                debug(LogRecord(
-                    event=LogEvent.STREAMING_REQUEST.value,
-                    message="Could not access raw SSE stream",
-                    request_id=request_id,
-                    data={"error": str(e)},
-                ))
+            pass
 
         message_start_event_data = {
             "type": "message_start",
@@ -1673,17 +1531,6 @@ async def handle_anthropic_streaming_response_from_openai_stream(
                 # Extract cost and cache tokens from message_delta usage (OpenRouter)
                 if chunk.usage:
                     # Debug: inspect chunk.usage structure
-                    if VERBOSE_LOGGING:
-                        debug(LogRecord(
-                            event=LogEvent.STREAMING_REQUEST.value,
-                            message="Chunk usage debug",
-                            request_id=request_id,
-                            data={
-                                "usage_type": type(chunk.usage).__name__,
-                                "usage_dict": chunk.usage.model_dump() if hasattr(chunk.usage, 'model_dump') else str(chunk.usage),
-                                "usage_attrs": {k: v for k, v in chunk.usage.__dict__.items() if not k.startswith('_')} if hasattr(chunk.usage, '__dict__') else None,
-                            },
-                        ))
 
                     # Extract cost from chunk.usage (OpenRouter)
                     if hasattr(chunk.usage, 'cost'):
@@ -1760,14 +1607,6 @@ async def handle_anthropic_streaming_response_from_openai_stream(
                             "name": "",
                             "arguments_buffer": "",
                         }
-                        if not tool_delta.id:
-                            warning(
-                                LogRecord(
-                                    LogEvent.TOOL_ID_PLACEHOLDER.value,
-                                    f"Generated placeholder Tool ID for OpenAI tool index {openai_tc_idx} -> Anthropic block {current_anthropic_tool_block_idx}",
-                                    request_id,
-                                )
-                            )
                     else:
                         current_anthropic_tool_block_idx = (
                             openai_tool_idx_to_anthropic_block_idx[openai_tc_idx]
@@ -1776,14 +1615,6 @@ async def handle_anthropic_streaming_response_from_openai_stream(
                     tool_state = tool_states[current_anthropic_tool_block_idx]
 
                     if tool_delta.id and tool_state["id"].startswith("tool_ph_"):
-                        if VERBOSE_LOGGING:
-                            debug(
-                                LogRecord(
-                                    LogEvent.TOOL_ID_UPDATED.value,
-                                    f"Updated placeholder Tool ID for Anthropic block {current_anthropic_tool_block_idx} to {tool_delta.id}",
-                                    request_id,
-                                )
-                            )
                         tool_state["id"] = tool_delta.id
 
                     if tool_delta.function:
@@ -1848,10 +1679,11 @@ async def handle_anthropic_streaming_response_from_openai_stream(
                 try:
                     json.loads(tool_state_to_finalize["arguments_buffer"])
                 except json.JSONDecodeError:
-                    warning(
-                        LogRecord(
-                            event=LogEvent.TOOL_ARGS_PARSE_FAILURE.value,
-                            message=f"Buffered arguments for tool '{tool_state_to_finalize.get('name')}' (Anthropic block {anthropic_tool_idx}) did not form valid JSON.",
+                    if VERBOSE_LOGGING:
+                        warning(
+                            LogRecord(
+                                event=LogEvent.TOOL_ARGS_PARSE_FAILURE.value,
+                                message=f"Buffered arguments for tool '{tool_state_to_finalize.get('name')}' (Anthropic block {anthropic_tool_idx}) did not form valid JSON.",
                             request_id=request_id,
                             data={
                                 "buffered_args": tool_state_to_finalize[
@@ -1929,6 +1761,8 @@ async def handle_anthropic_streaming_response_from_openai_stream(
         if cache_creation_input_tokens or cache_read_input_tokens:
             log_data["cache_creation_input_tokens"] = cache_creation_input_tokens
             log_data["cache_read_input_tokens"] = cache_read_input_tokens
+        if target_model_name:
+            log_data["target_model"] = target_model_name
         _summary_tracker.append(_RequestMetrics(
             request_id=request_id,
             duration_ms=log_data.get("duration_ms", 0),
@@ -1936,7 +1770,7 @@ async def handle_anthropic_streaming_response_from_openai_stream(
             output_tokens=log_data.get("output_tokens", 0),
             cost=log_data.get("cost"),
             provider=log_data.get("provider"),
-            target_model=log_data.get("target_model"),
+            target_model=target_model_name or None,
             cache_creation=log_data.get("cache_creation_input_tokens", 0) or 0,
             cache_read=log_data.get("cache_read_input_tokens", 0) or 0,
         ))
@@ -1969,6 +1803,7 @@ async def handle_anthropic_streaming_from_raw_httpx(
     estimated_input_tokens: int,
     request_id: str,
     start_time_mono: float,
+    target_model_name: str = "",
 ) -> AsyncGenerator[str, None]:
     """
     Consumes raw httpx SSE stream and yields Anthropic-compatible SSE events.
@@ -1997,19 +1832,12 @@ async def handle_anthropic_streaming_from_raw_httpx(
     }
 
     stream_status_code = httpx_response.status_code
-    stream_final_message = "Streaming request completed successfully."
+    stream_final_message = ""
     stream_log_event = LogEvent.REQUEST_COMPLETED.value
 
     resp_data: Dict[str, Any] = {"status_code": stream_status_code, "body_type": "sse_stream"}
     if VERBOSE_LOGGING:
         resp_data["headers"] = mask_secrets(dict(httpx_response.headers))
-    if VERBOSE_LOGGING:
-        debug(LogRecord(
-            event=LogEvent.UPSTREAM_RESPONSE.value,
-            message=f"Provider→PROXY {stream_status_code} <SSE stream>",
-            request_id=request_id,
-            data=resp_data,
-        ))
 
     try:
         msg_start = {
@@ -2190,6 +2018,8 @@ async def handle_anthropic_streaming_from_raw_httpx(
         if cache_creation_input_tokens or cache_read_input_tokens:
             log_data["cache_creation_input_tokens"] = cache_creation_input_tokens
             log_data["cache_read_input_tokens"] = cache_read_input_tokens
+        if target_model_name:
+            log_data["target_model"] = target_model_name
 
         _summary_tracker.append(_RequestMetrics(
             request_id=request_id,
@@ -2198,7 +2028,7 @@ async def handle_anthropic_streaming_from_raw_httpx(
             output_tokens=log_data.get("output_tokens", 0),
             cost=log_data.get("cost"),
             provider=log_data.get("provider"),
-            target_model=log_data.get("target_model"),
+            target_model=target_model_name or None,
             cache_creation=log_data.get("cache_creation_input_tokens", 0) or 0,
             cache_read=log_data.get("cache_read_input_tokens", 0) or 0,
         ))
@@ -2379,16 +2209,7 @@ async def create_message_proxy(
             except Exception:
                 anthropic_request_data["body"] = raw_body
 
-        if VERBOSE_LOGGING:
-            debug(
-                LogRecord(
-                    LogEvent.ANTHROPIC_REQUEST.value,
-                    "Received Anthropic request body",
-                    request_id,
-                    anthropic_request_data,
-                )
-            )
-        
+
         api_key = request.headers.get("x-api-key")
         if proxy_config.proxy_api_key and api_key != proxy_config.proxy_api_key:
             return await _log_and_return_error_response(
@@ -2433,15 +2254,11 @@ async def create_message_proxy(
     info(
         LogRecord(
             event=LogEvent.REQUEST_START.value,
-            message="Processing new message request",
+            message="",
             request_id=request_id,
             data={
                 "client_model": anthropic_request.model,
                 "target_model": target_model_name,
-                "stream": is_stream,
-                "estimated_input_tokens": estimated_input_tokens,
-                "client_ip": request.client.host if request.client else "unknown",
-                "user_agent": request.headers.get("user-agent", "unknown"),
             },
         )
     )
@@ -2489,26 +2306,9 @@ async def create_message_proxy(
     if target_conn.provider:
         openai_params["extra_body"] = {"provider": {"order": target_conn.provider}}
 
-    if VERBOSE_LOGGING:
-        debug(
-            LogRecord(
-                LogEvent.OPENAI_REQUEST.value,
-                "Prepared OpenAI request parameters",
-                request_id,
-                {"params": openai_params},
-            )
-        )
 
     try:
         if is_stream:
-            if VERBOSE_LOGGING:
-                debug(
-                    LogRecord(
-                        LogEvent.STREAMING_REQUEST.value,
-                        "Initiating streaming request to OpenAI-compatible API",
-                        request_id,
-                    )
-                )
             # Try raw httpx streaming for OpenRouter, fallback to OpenAI SDK
             try:
                 httpx_client = httpx.AsyncClient(
@@ -2547,30 +2347,12 @@ async def create_message_proxy(
                 if VERBOSE_LOGGING:
                     log_data["headers"] = mask_secrets(dict(req.headers))
                     log_data["body"] = truncate_large_structures(raw_body)
-                if VERBOSE_LOGGING:
-                    debug(LogRecord(
-                        event=LogEvent.UPSTREAM_REQUEST.value,
-                        message=f"PROXY→Provider {raw_body.get('model', '?')}",
-                        request_id=request_id,
-                        data=log_data,
-                    ))
 
                 httpx_response = await httpx_client.send(req, stream=True)
 
                 if httpx_response.status_code != 200:
                     await httpx_response.aread()
                     error_body = httpx_response.text
-                    if VERBOSE_LOGGING:
-                        debug(LogRecord(
-                            event=LogEvent.UPSTREAM_RESPONSE.value,
-                            message=f"Provider→PROXY {httpx_response.status_code} ERROR",
-                            request_id=request_id,
-                            data={
-                                "status_code": httpx_response.status_code,
-                                "body": error_body[:500],
-                                "headers": mask_secrets(dict(httpx_response.headers)) if VERBOSE_LOGGING else None,
-                            },
-                        ))
                     await httpx_response.aclose()
                     await httpx_client.aclose()
                     httpx_response.raise_for_status()
@@ -2583,6 +2365,7 @@ async def create_message_proxy(
                         estimated_input_tokens,
                         request_id,
                         request.state.start_time_monotonic,
+                        target_model_name=target_model_name,
                     ),
                     media_type="text/event-stream",
                 )
@@ -2607,31 +2390,14 @@ async def create_message_proxy(
                         estimated_input_tokens,
                         request_id,
                         request.state.start_time_monotonic,
+                        target_model_name=target_model_name,
                     ),
                     media_type="text/event-stream",
                 )
         else:
-            if VERBOSE_LOGGING:
-                debug(
-                    LogRecord(
-                        LogEvent.OPENAI_REQUEST.value,
-                        "Sending non-streaming request to OpenAI-compatible API",
-                        request_id,
-                    )
-                )
             openai_response_obj = await target_client.chat.completions.create(
                 **openai_params
             )
-
-            if VERBOSE_LOGGING:
-                debug(
-                    LogRecord(
-                        LogEvent.OPENAI_RESPONSE.value,
-                        "Received OpenAI response",
-                        request_id,
-                        {"response": openai_response_obj.model_dump()},
-                    )
-                )
 
             anthropic_response_obj = convert_openai_to_anthropic_response(
                 openai_response_obj, anthropic_request.model, request_id=request_id
@@ -2695,20 +2461,11 @@ async def create_message_proxy(
             info(
                 LogRecord(
                     event=LogEvent.REQUEST_COMPLETED.value,
-                    message="Non-streaming request completed successfully",
+                    message="",
                     request_id=request_id,
                     data=non_stream_data,
                 )
             )
-            if VERBOSE_LOGGING:
-                debug(
-                    LogRecord(
-                        LogEvent.ANTHROPIC_RESPONSE.value,
-                        "Prepared Anthropic response",
-                        request_id,
-                        {"response": anthropic_response_obj.model_dump(exclude_unset=True)},
-                    )
-                )
             return JSONResponse(
                 content=anthropic_response_obj.model_dump(exclude_unset=True)
             )
@@ -2761,30 +2518,12 @@ async def count_tokens_endpoint(request: Request) -> TokenCountResponse:
         request_id=request_id,
     )
     duration_ms = (time.monotonic() - start_time_mono) * 1000
-    info(
-        LogRecord(
-            event=LogEvent.TOKEN_COUNT.value,
-            message=f"Counted {token_count} tokens",
-            request_id=request_id,
-            data={
-                "duration_ms": duration_ms,
-                "token_count": token_count,
-                "model": count_request.model,
-            },
-        )
-    )
     return TokenCountResponse(input_tokens=token_count)
 
 
 @app.get("/", include_in_schema=False, tags=["Health"])
 async def root_health_check() -> JSONResponse:
     """Basic health check and information endpoint."""
-    if VERBOSE_LOGGING:
-        debug(
-            LogRecord(
-                event=LogEvent.HEALTH_CHECK.value, message="Root health check accessed"
-            )
-        )
     return JSONResponse(
         {
             "proxy_name": settings.app_name,
