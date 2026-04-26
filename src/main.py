@@ -1839,6 +1839,10 @@ async def handle_anthropic_streaming_response_from_openai_stream(
 
                     cache_creation_input_tokens = cache_write
                     cache_read_input_tokens = cache_read
+
+                    # Update estimated_input_tokens with the exact count from the provider if available
+                    if hasattr(chunk.usage, 'prompt_tokens') and getattr(chunk.usage, 'prompt_tokens', None) is not None:
+                        estimated_input_tokens = chunk.usage.prompt_tokens
                 continue
 
             delta = chunk.choices[0].delta
