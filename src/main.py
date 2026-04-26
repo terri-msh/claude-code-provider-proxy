@@ -31,6 +31,7 @@ from openai.types.chat import (ChatCompletionMessageParam,
                                ChatCompletionToolParam)
 from pydantic import BaseModel, Field, ValidationError, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from rich.markup import escape
 from rich.console import Console
 from rich.panel import Panel
 from rich.rule import Rule
@@ -90,12 +91,19 @@ _parser = argparse.ArgumentParser()
 _parser.add_argument("--verbose", action="store_true")
 _parser.add_argument("--log-json", action="store_true")
 _parser.add_argument("--summary-every", type=int, default=3, help="Print summary every N requests")
-_args, _remaining = _parser.parse_known_args()
-sys.argv = _remaining  # remove our flags so uvicorn doesn't complain
+
+def _parse_cli_args():
+    _args, _remaining = _parser.parse_known_args()
+    # Only mutate sys.argv when running as main, not when imported for testing
+    if _remaining != sys.argv[1:]:
+        sys.argv = [sys.argv[0], *_remaining]
+    return _args
+
+_args = _parse_cli_args()
 
 VERBOSE_LOGGING = _args.verbose
 LOG_JSON = _args.log_json
-SUMMARY_EVERY = _args.summary_every
+SUMMARY_EVERY = max(1, _args.summary_every)
 
 @dataclasses.dataclass
 class _RequestMetrics:
@@ -133,14 +141,14 @@ def _print_summary() -> None:
     for r in _summary_tracker:
         if r.provider:
             provider_counts[r.provider] = provider_counts.get(r.provider, 0) + 1
-    provider_str = ", ".join(f"[blue]{p}[/]×{c}" for p, c in sorted(provider_counts.items(), key=lambda x: -x[1]))
+    provider_str = ", ".join(f"[blue]{escape(p)}[/]×{c}" for p, c in sorted(provider_counts.items(), key=lambda x: -x[1]))
 
     # Count models
     model_counts: dict[str, int] = {}
     for r in _summary_tracker:
         if r.target_model:
             model_counts[r.target_model] = model_counts.get(r.target_model, 0) + 1
-    model_str = ", ".join(f"[blue]{m}[/]×{c}" for m, c in sorted(model_counts.items(), key=lambda x: -x[1]))
+    model_str = ", ".join(f"[blue]{escape(m)}[/]×{c}" for m, c in sorted(model_counts.items(), key=lambda x: -x[1]))
 
     # Duration color
     dur_color = "green" if avg_duration < 5000 else "yellow" if avg_duration < 15000 else "red"
@@ -267,26 +275,6 @@ def mask_secrets(headers: Dict[str, str]) -> Dict[str, str]:
             masked[key] = value
     return masked
 
-def extract_last_user_prompt(body: Dict[str, Any], max_len: int = 80) -> str:
-    """Extracts the last user message content from an OpenAI-style request body."""
-    messages = body.get("messages", [])
-    last_user_content = ""
-    for msg in reversed(messages):
-        if isinstance(msg, dict) and msg.get("role") == "user":
-            content = msg.get("content", "")
-            if isinstance(content, list):
-                texts = [
-                    p.get("text", "") for p in content
-                    if isinstance(p, dict) and p.get("type") == "text"
-                ]
-                last_user_content = " ".join(texts)
-            elif isinstance(content, str):
-                last_user_content = content
-            break
-    if len(last_user_content) > max_len:
-        return last_user_content[:max_len - 3] + "..."
-    return last_user_content
-
 class YandexAuth(httpx.Auth):
     def __init__(self, token: str):
         self.token = token
@@ -309,7 +297,6 @@ async def log_request_hook(request: httpx.Request):
             parsed_body = json.loads(body_str)
             data["target_model"] = parsed_body.get("model", "?")
             data["stream"] = parsed_body.get("stream", False)
-            data["last_user_prompt"] = extract_last_user_prompt(parsed_body)
             cache_paths = extract_cache_control_paths(parsed_body)
             if cache_paths:
                 data["cache_breakpoints"] = cache_paths
@@ -484,11 +471,13 @@ class PrettyConsoleFormatter(logging.Formatter):
         rid = f"[dim]#{rec.request_id[:8]}[/] " if rec.request_id else ""
 
         if event == LogEvent.REQUEST_START.value:
-            client_m = data.get("client_model", "?")
-            target_m = data.get("target_model", "?")
+            client_m = escape(data.get("client_model", "?"))
+            target_m = escape(data.get("target_model", "?"))
+            client_ip = escape(data.get("client_ip", ""))
+            ip_str = f" [dim]{client_ip}[/]" if client_ip and client_ip != "?" else ""
             return (
                 f"[dim]{ts}[/] [{style}]{badge}[/] {rid}"
-                f"[bold cyan]{client_m}[/] → [bold magenta]{target_m}[/]"
+                f"[bold cyan]{client_m}[/] → [bold magenta]{target_m}[/]{ip_str}"
             )
 
         if event == LogEvent.REQUEST_COMPLETED.value:
@@ -500,7 +489,7 @@ class PrettyConsoleFormatter(logging.Formatter):
             cost = data.get("cost")
             cost_str = f"[green]${cost:.4f}[/]  " if cost else ""
             provider = data.get("provider")
-            provider_str = f"[blue]prov={provider}[/]  " if provider else ""
+            provider_str = f"[blue]prov={escape(provider)}[/]  " if provider else ""
 
             # Cache percentage
             cache_create = data.get("cache_creation_input_tokens", 0) or 0
@@ -531,7 +520,6 @@ class PrettyConsoleFormatter(logging.Formatter):
             err_type = data.get("error_type", "unknown")
             dur = data.get("duration_ms", 0)
             client_m = data.get("client_model", "")
-            from rich.markup import escape
             model_info = f" \\[[bold]{escape(client_m)}[/]\\]" if client_m and client_m != "unknown" else ""
             return (
                 f"[dim]{ts}[/] [{style}]{badge}[/] {rid}"
@@ -562,7 +550,7 @@ class PrettyConsoleFormatter(logging.Formatter):
         if data:
             brief_keys = [k for k in data if k not in ("body", "response", "params")]
             if brief_keys:
-                parts = [f"{k}={data[k]}" for k in brief_keys[:3]]
+                parts = [f"{escape(str(k))}={escape(str(data[k]))}" for k in brief_keys[:3]]
                 extra = f" [dim]({', '.join(parts)})[/]"
         return f"[dim]{ts}[/] [{style}]{badge}[/] {rid}{rec.message}{extra}"
 
@@ -957,15 +945,14 @@ def count_tokens_for_anthropic_request(
                         input_str = json.dumps(block.input)
                         total_tokens += len(enc.encode(input_str))
                     except Exception:
-                        if VERBOSE_LOGGING:
-                            warning(
-                                LogRecord(
-                                    event=LogEvent.TOOL_INPUT_SERIALIZATION_FAILURE.value,
-                                    message="Failed to serialize tool input for token counting.",
-                                    data={"tool_name": block.name},
-                                    request_id=request_id,
-                                )
+                        warning(
+                            LogRecord(
+                                event=LogEvent.TOOL_INPUT_SERIALIZATION_FAILURE.value,
+                                message="Failed to serialize tool input for token counting.",
+                                data={"tool_name": block.name},
+                                request_id=request_id,
                             )
+                        )
                 elif isinstance(block, ContentBlockToolResult):
                     try:
                         content_str = ""
@@ -984,14 +971,13 @@ def count_tokens_for_anthropic_request(
                             content_str = json.dumps(block.content)
                         total_tokens += len(enc.encode(content_str))
                     except Exception:
-                        if VERBOSE_LOGGING:
-                            warning(
-                                LogRecord(
-                                    event=LogEvent.TOOL_RESULT_SERIALIZATION_FAILURE.value,
-                                    message="Failed to serialize tool result for token counting.",
-                                    request_id=request_id,
-                                )
+                        warning(
+                            LogRecord(
+                                event=LogEvent.TOOL_RESULT_SERIALIZATION_FAILURE.value,
+                                message="Failed to serialize tool result for token counting.",
+                                request_id=request_id,
                             )
+                        )
 
     if tools:
         total_tokens += 2
@@ -1003,15 +989,14 @@ def count_tokens_for_anthropic_request(
                 schema_str = json.dumps(tool.input_schema)
                 total_tokens += len(enc.encode(schema_str))
             except Exception:
-                if VERBOSE_LOGGING:
-                    warning(
-                        LogRecord(
-                            event=LogEvent.TOOL_INPUT_SERIALIZATION_FAILURE.value,
-                            message="Failed to serialize tool schema for token counting.",
-                            data={"tool_name": tool.name},
-                            request_id=request_id,
-                        )
+                warning(
+                    LogRecord(
+                        event=LogEvent.TOOL_INPUT_SERIALIZATION_FAILURE.value,
+                        message="Failed to serialize tool schema for token counting.",
+                        data={"tool_name": tool.name},
+                        request_id=request_id,
                     )
+                )
     return total_tokens
 
 
@@ -1034,19 +1019,16 @@ def _serialize_tool_result_content_for_openai(
 
     if isinstance(anthropic_tool_result_content, list):
         processed_parts = []
-        contains_non_text_block = False
         for item in anthropic_tool_result_content:
             if isinstance(item, dict) and item.get("type") == "text" and "text" in item:
                 processed_parts.append(str(item["text"]))
             else:
                 try:
                     processed_parts.append(json.dumps(item))
-                    contains_non_text_block = True
                 except TypeError:
                     processed_parts.append(
                         f"<unserializable_item type='{type(item).__name__}'>"
                     )
-                    contains_non_text_block = True
 
         result_str = "\n".join(processed_parts)
         return result_str
@@ -1054,13 +1036,12 @@ def _serialize_tool_result_content_for_openai(
     try:
         return json.dumps(anthropic_tool_result_content)
     except TypeError as e:
-        if VERBOSE_LOGGING:
-            warning(
-                LogRecord(
-                    event=LogEvent.TOOL_RESULT_SERIALIZATION_FAILURE.value,
-                    message=f"Failed to serialize tool result content to JSON: {e}. Returning error JSON.",
-                    request_id=request_id,
-                    data=log_context,
+        warning(
+            LogRecord(
+                event=LogEvent.TOOL_RESULT_SERIALIZATION_FAILURE.value,
+                message=f"Failed to serialize tool result content to JSON: {e}. Returning error JSON.",
+                request_id=request_id,
+                data=log_context,
                 )
             )
         return json.dumps(
@@ -1530,8 +1511,6 @@ async def handle_anthropic_streaming_response_from_openai_stream(
             if not chunk.choices:
                 # Extract cost and cache tokens from message_delta usage (OpenRouter)
                 if chunk.usage:
-                    # Debug: inspect chunk.usage structure
-
                     # Extract cost from chunk.usage (OpenRouter)
                     if hasattr(chunk.usage, 'cost'):
                         cost_value = getattr(chunk.usage, 'cost', None)
@@ -1679,17 +1658,16 @@ async def handle_anthropic_streaming_response_from_openai_stream(
                 try:
                     json.loads(tool_state_to_finalize["arguments_buffer"])
                 except json.JSONDecodeError:
-                    if VERBOSE_LOGGING:
-                        warning(
-                            LogRecord(
-                                event=LogEvent.TOOL_ARGS_PARSE_FAILURE.value,
-                                message=f"Buffered arguments for tool '{tool_state_to_finalize.get('name')}' (Anthropic block {anthropic_tool_idx}) did not form valid JSON.",
-                            request_id=request_id,
-                            data={
-                                "buffered_args": tool_state_to_finalize[
-                                    "arguments_buffer"
-                                ][:100]
-                            },
+                    warning(
+                        LogRecord(
+                            event=LogEvent.TOOL_ARGS_PARSE_FAILURE.value,
+                            message=f"Buffered arguments for tool '{tool_state_to_finalize.get('name')}' (Anthropic block {anthropic_tool_idx}) did not form valid JSON.",
+                        request_id=request_id,
+                        data={
+                            "buffered_args": tool_state_to_finalize[
+                                "arguments_buffer"
+                            ][:100]
+                        },
                         )
                     )
             yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': anthropic_tool_idx})}\n\n"
@@ -2220,7 +2198,7 @@ async def create_message_proxy(
             )
 
         anthropic_request = MessagesRequest.model_validate(
-            raw_body, context={"request_id": request_id}
+            raw_json, context={"request_id": request_id}
         )
     except json.JSONDecodeError as e:
         return await _log_and_return_error_response(
@@ -2259,6 +2237,7 @@ async def create_message_proxy(
             data={
                 "client_model": anthropic_request.model,
                 "target_model": target_model_name,
+                "client_ip": request.client.host if request.client else "?",
             },
         )
     )
@@ -2342,7 +2321,6 @@ async def create_message_proxy(
                 log_data: Dict[str, Any] = {
                     "target_model": raw_body.get("model", "?"),
                     "stream": True,
-                    "last_user_prompt": extract_last_user_prompt(raw_body),
                 }
                 if VERBOSE_LOGGING:
                     log_data["headers"] = mask_secrets(dict(req.headers))

@@ -7,7 +7,6 @@ from main import (
     LogEvent,
     LogRecord,
     PrettyConsoleFormatter,
-    extract_last_user_prompt,
     mask_secrets,
 )
 
@@ -96,115 +95,6 @@ class TestMaskSecrets:
         assert "X-Api-Key" in masked
         # First 8 chars of "longapikeyvalue123": "longapik"
         assert masked["X-Api-Key"] == "longapik...XXX"
-
-
-# ---------------------------------------------------------------------------
-# extract_last_user_prompt
-# ---------------------------------------------------------------------------
-
-
-class TestExtractLastUserPrompt:
-    def test_simple_string_content(self):
-        body = {"messages": [{"role": "user", "content": "Hello, world!"}]}
-        result = extract_last_user_prompt(body)
-        assert result == "Hello, world!"
-
-    def test_list_content_with_text_type(self):
-        body = {
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "Part one"},
-                        {"type": "text", "text": "Part two"},
-                    ],
-                }
-            ]
-        }
-        result = extract_last_user_prompt(body)
-        assert result == "Part one Part two"
-
-    def test_last_user_message_when_multiple(self):
-        body = {
-            "messages": [
-                {"role": "user", "content": "First question"},
-                {"role": "assistant", "content": "First answer"},
-                {"role": "user", "content": "Second question"},
-            ]
-        }
-        result = extract_last_user_prompt(body)
-        assert result == "Second question"
-
-    def test_truncation(self):
-        long_text = "A" * 100
-        body = {"messages": [{"role": "user", "content": long_text}]}
-        result = extract_last_user_prompt(body, max_len=80)
-        # max_len=80, so first 77 chars + "..."
-        assert result == "A" * 77 + "..."
-        assert len(result) == 80
-
-    def test_custom_max_len(self):
-        body = {"messages": [{"role": "user", "content": "Hello, world!"}]}
-        result = extract_last_user_prompt(body, max_len=5)
-        # max_len=5, so first 2 chars + "..."
-        assert result == "He..."
-
-    def test_no_messages(self):
-        body = {}
-        result = extract_last_user_prompt(body)
-        assert result == ""
-
-    def test_empty_messages(self):
-        body = {"messages": []}
-        result = extract_last_user_prompt(body)
-        assert result == ""
-
-    def test_no_user_messages(self):
-        body = {"messages": [{"role": "assistant", "content": "No user here"}]}
-        result = extract_last_user_prompt(body)
-        assert result == ""
-
-    def test_content_list_with_non_text_types(self):
-        body = {
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "source": "data"},
-                        {"type": "text", "text": "Only this text"},
-                    ],
-                }
-            ]
-        }
-        result = extract_last_user_prompt(body)
-        assert result == "Only this text"
-
-    def test_content_list_with_only_non_text(self):
-        body = {
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "source": "data"},
-                    ],
-                }
-            ]
-        }
-        result = extract_last_user_prompt(body)
-        assert result == ""
-
-    def test_exact_max_len_no_truncation(self):
-        text = "A" * 80
-        body = {"messages": [{"role": "user", "content": text}]}
-        result = extract_last_user_prompt(body, max_len=80)
-        assert result == text
-        assert "..." not in result
-
-    def test_one_over_max_len_truncation(self):
-        text = "A" * 81
-        body = {"messages": [{"role": "user", "content": text}]}
-        result = extract_last_user_prompt(body, max_len=80)
-        assert result == "A" * 77 + "..."
 
 
 # ---------------------------------------------------------------------------
