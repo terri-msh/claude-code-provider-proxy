@@ -48,6 +48,7 @@ class ConnectionConfig(BaseModel):
     api_key: str
     target_model: str
     provider: Optional[List[str]] = None
+    allow_fallbacks: bool = False
 
 class MappingsConfig(BaseModel):
     big_model: str
@@ -345,24 +346,32 @@ async def log_response_hook(response: httpx.Response):
         )
     )
 
-def load_proxy_config() -> None:
-    global proxy_config, clients_pool
+_config_last_mtime: float = 0.0
+
+def load_proxy_config(is_reload: bool = False) -> None:
+    global proxy_config, clients_pool, _config_last_mtime
     try:
+        mtime = os.path.getmtime(settings.config_path)
         with open(settings.config_path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f)
-        proxy_config = ProxyConfig(**data)
+        new_proxy_config = ProxyConfig(**data)
     except Exception as e:
-        _error_console.print(f"[bold red]Configuration Error:[/bold red] Failed to load {settings.config_path}: {e}")
-        sys.exit(1)
+        if not is_reload:
+            _error_console.print(f"[bold red]Configuration Error:[/bold red] Failed to load {settings.config_path}: {e}")
+            sys.exit(1)
+        else:
+            error(LogRecord(event=LogEvent.MODEL_SELECTION.value, message=f"Failed to reload config: {e}"))
+            return
 
-    for conn_id, conn_cfg in proxy_config.connections.items():
+    new_clients_pool = {}
+    for conn_id, conn_cfg in new_proxy_config.connections.items():
         http_client = httpx.AsyncClient(
             event_hooks={'request': [log_request_hook], 'response': [log_response_hook]},
             verify=False,
             timeout=180.0,
             auth=YandexAuth(conn_cfg.api_key)
         )
-        clients_pool[conn_id] = openai.AsyncClient(
+        new_clients_pool[conn_id] = openai.AsyncClient(
             api_key=conn_cfg.api_key,
             base_url=conn_cfg.base_url,
             default_headers={
@@ -371,6 +380,20 @@ def load_proxy_config() -> None:
             },
             http_client=http_client,
         )
+
+    proxy_config = new_proxy_config
+    clients_pool = new_clients_pool
+    _config_last_mtime = mtime
+    if is_reload:
+        info(LogRecord(event=LogEvent.MODEL_SELECTION.value, message="Configuration reloaded successfully"))
+
+def check_and_reload_config() -> None:
+    try:
+        current_mtime = os.path.getmtime(settings.config_path)
+        if current_mtime > _config_last_mtime:
+            load_proxy_config(is_reload=True)
+    except OSError:
+        pass
 
 load_proxy_config()
 
@@ -923,16 +946,12 @@ def extract_provider_error_details(
 
     parsed_raw_error: Optional[Dict[str, Any]] = None
     if isinstance(raw_error_str, str):
+        # Many providers (e.g. Io Net, SiliconFlow) return plain text strings instead of JSON.
+        # We try to parse it as JSON, but if it fails, we gracefully treat it as a plain message.
         try:
             parsed_raw_error = json.loads(raw_error_str)
         except json.JSONDecodeError:
-            warning(
-                LogRecord(
-                    event=LogEvent.PROVIDER_ERROR_DETAILS.value,
-                    message=f"Failed to parse raw provider error string for {provider_name}.",
-                )
-            )
-            parsed_raw_error = {"raw_string_parse_failed": raw_error_str}
+            parsed_raw_error = {"message": raw_error_str}
     elif isinstance(raw_error_str, dict):
         parsed_raw_error = raw_error_str
 
@@ -1099,9 +1118,8 @@ def _serialize_tool_result_content_for_openai(
     as expected by OpenAI for the 'content' field of a 'tool' role message.
     """
     if isinstance(anthropic_tool_result_content, str):
-        return anthropic_tool_result_content
-
-    if isinstance(anthropic_tool_result_content, list):
+        result_str = anthropic_tool_result_content
+    elif isinstance(anthropic_tool_result_content, list):
         processed_parts = []
         contains_non_text_block = False
         for item in anthropic_tool_result_content:
@@ -1127,31 +1145,38 @@ def _serialize_tool_result_content_for_openai(
                     data={**log_context, "result_str_preview": result_str[:100]},
                 )
             )
-        return result_str
-
-    try:
-        return json.dumps(anthropic_tool_result_content)
-    except TypeError as e:
-        warning(
-            LogRecord(
-                event=LogEvent.TOOL_RESULT_SERIALIZATION_FAILURE.value,
-                message=f"Failed to serialize tool result content to JSON: {e}. Returning error JSON.",
-                request_id=request_id,
-                data=log_context,
+    else:
+        try:
+            result_str = json.dumps(anthropic_tool_result_content)
+        except TypeError as e:
+            warning(
+                LogRecord(
+                    event=LogEvent.TOOL_RESULT_SERIALIZATION_FAILURE.value,
+                    message=f"Failed to serialize tool result content to JSON: {e}. Returning error JSON.",
+                    request_id=request_id,
+                    data=log_context,
+                )
             )
-        )
-        return json.dumps(
-            {
-                "error": "Serialization failed",
-                "original_type": str(type(anthropic_tool_result_content)),
-            }
-        )
+            result_str = json.dumps(
+                {
+                    "error": "Serialization failed",
+                    "original_type": str(type(anthropic_tool_result_content)),
+                }
+            )
 
+    # Prevent models like GLM/DeepSeek from perceiving empty tool outputs as empty user messages
+    if not result_str.strip():
+        return "Tool executed successfully with no output."
+    return result_str
+
+
+import re
 
 def convert_anthropic_to_openai_messages(
     anthropic_messages: List[Message],
     anthropic_system: Optional[Union[str, List[SystemContent]]] = None,
     request_id: Optional[str] = None,
+    strip_cache: bool = False,
 ) -> List[Dict[str, Any]]:
     openai_messages: List[Dict[str, Any]] = []
 
@@ -1163,7 +1188,7 @@ def convert_anthropic_to_openai_messages(
         for block in anthropic_system:
             if isinstance(block, SystemContent) and block.type == "text":
                 part: Dict[str, Any] = {"type": "text", "text": block.text}
-                if getattr(block, "cache_control", None):
+                if getattr(block, "cache_control", None) and not strip_cache:
                     part["cache_control"] = block.cache_control
                 sys_parts.append(part)
         
@@ -1214,7 +1239,7 @@ def convert_anthropic_to_openai_messages(
                 if isinstance(block, ContentBlockText):
                     if role == "user":
                         openai_part: Dict[str, Any] = {"type": "text", "text": block.text}
-                        if getattr(block, "cache_control", None):
+                        if getattr(block, "cache_control", None) and not strip_cache:
                             openai_part["cache_control"] = block.cache_control
                         openai_parts_for_user_message.append(openai_part)
                     elif role == "assistant":
@@ -1228,7 +1253,7 @@ def convert_anthropic_to_openai_messages(
                                 "url": f"data:{block.source.media_type};base64,{block.source.data}"
                             },
                         }
-                        if getattr(block, "cache_control", None):
+                        if getattr(block, "cache_control", None) and not strip_cache:
                             img_part["cache_control"] = block.cache_control
                         openai_parts_for_user_message.append(img_part)
                     else:
@@ -1277,16 +1302,19 @@ def convert_anthropic_to_openai_messages(
                         "tool_call_id": block.tool_use_id,
                         "content": serialized_content,
                     }
-                    if getattr(block, "cache_control", None):
+                    if getattr(block, "cache_control", None) and not strip_cache:
                         tool_msg["cache_control"] = block.cache_control
                     openai_messages.append(tool_msg)
 
             if role == "user" and openai_parts_for_user_message:
+                has_cache_control = any(
+                    "cache_control" in part for part in openai_parts_for_user_message
+                )
                 is_multimodal = any(
                     part["type"] == "image_url"
                     for part in openai_parts_for_user_message
                 )
-                if is_multimodal or len(openai_parts_for_user_message) > 1:
+                if has_cache_control or is_multimodal or len(openai_parts_for_user_message) > 1:
                     openai_messages.append(
                         {"role": "user", "content": openai_parts_for_user_message}
                     )
@@ -1300,9 +1328,6 @@ def convert_anthropic_to_openai_messages(
                             "content": openai_parts_for_user_message[0]["text"],
                         }
                     )
-                elif not openai_parts_for_user_message:
-                    openai_messages.append({"role": "user", "content": ""})
-
             if role == "assistant":
                 assistant_text = "\n".join(filter(None, text_content_for_assistant))
                 if assistant_text:
@@ -1314,23 +1339,8 @@ def convert_anthropic_to_openai_messages(
                     if (
                         openai_messages
                         and openai_messages[-1]["role"] == "assistant"
-                        and openai_messages[-1].get("content")
-                    ):
-                        openai_messages.append(
-                            {
-                                "role": "assistant",
-                                "content": None,
-                                "tool_calls": assistant_tool_calls,
-                            }
-                        )
-
-                    elif (
-                        openai_messages
-                        and openai_messages[-1]["role"] == "assistant"
-                        and not openai_messages[-1].get("tool_calls")
                     ):
                         openai_messages[-1]["tool_calls"] = assistant_tool_calls
-                        openai_messages[-1]["content"] = None
                     else:
                         openai_messages.append(
                             {
@@ -1342,24 +1352,114 @@ def convert_anthropic_to_openai_messages(
 
     final_openai_messages = []
     for msg_dict in openai_messages:
-        if (
-            msg_dict.get("role") == "assistant"
-            and msg_dict.get("tool_calls")
-            and msg_dict.get("content") is not None
-        ):
-            warning(
-                LogRecord(
-                    event=LogEvent.MESSAGE_FORMAT_NORMALIZED.value,
-                    message="Corrected assistant message with tool_calls to have content: None.",
-                    request_id=request_id,
-                    data={"original_content": msg_dict["content"]},
-                )
-            )
-            msg_dict["content"] = None
         final_openai_messages.append(msg_dict)
 
-    return final_openai_messages
+    # Fix Claude Code cache busting: Claude Code injects a dynamic billing header 
+    # into the system prompt AND user messages
+    # e.g., 'x-anthropic-billing-header: cc_version=2.1.112.387; cc_entrypoint=cli; cch=b4911;'
+    # The 'cch' value changes every request, which completely breaks exact prefix matching for caching.
+    if final_openai_messages:
+        for msg_dict in final_openai_messages:
+            content = msg_dict.get("content")
+            if isinstance(content, str):
+                msg_dict["content"] = re.sub(r"cch=[0-9a-fA-F]+;", "cch=static;", content)
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text" and "text" in part:
+                        part["text"] = re.sub(r"cch=[0-9a-fA-F]+;", "cch=static;", str(part["text"]))
 
+    # Dump the exact outgoing payload to OpenAI for debugging
+    try:
+        import copy
+        import hashlib
+        import datetime
+        
+        session_id = None
+        first_user_text = ""
+        
+        for msg in final_openai_messages:
+            content = msg.get("content", "")
+            content_str = content if isinstance(content, str) else str(content)
+            
+            if not session_id:
+                match = re.search(r"cc_session=([a-zA-Z0-9_-]+)", content_str)
+                if match:
+                    session_id = match.group(1)
+            
+            if msg.get("role") == "user" and not first_user_text:
+                first_user_text = content_str
+                
+        if not session_id:
+            if first_user_text:
+                session_id = hashlib.md5(first_user_text.encode("utf-8", errors="ignore")).hexdigest()[:8]
+            else:
+                session_id = "default"
+                
+        debug_messages = copy.deepcopy(final_openai_messages)
+        
+        tool_map = {}
+        for msg in debug_messages:
+            if msg.get("role") == "system" and isinstance(msg.get("content"), str):
+                if len(msg["content"]) > 500:
+                    msg["content"] = msg["content"][:500] + "... [TRUNCATED FOR DEBUG DUMP]"
+            
+            elif msg.get("role") == "assistant" and msg.get("tool_calls"):
+                for tc in msg["tool_calls"]:
+                    if tc.get("type") == "function":
+                        func = tc.get("function", {})
+                        try:
+                            args = json.loads(func.get("arguments", "{}"))
+                            tool_map[tc["id"]] = {"name": func.get("name"), "args": args}
+                            
+                            changed = False
+                            for k, v in args.items():
+                                if isinstance(v, str) and len(v) > 500:
+                                    args[k] = f"<{k} truncated, length={len(v)}>"
+                                    changed = True
+                            if changed:
+                                func["arguments"] = json.dumps(args, ensure_ascii=False)
+                        except Exception:
+                            tool_map[tc["id"]] = {"name": func.get("name"), "args": {}}
+            
+            elif msg.get("role") == "tool":
+                tid = msg.get("tool_call_id")
+                tinfo = tool_map.get(tid, {})
+                tname = tinfo.get("name", "tool")
+                
+                content = msg.get("content")
+                if isinstance(content, str) and len(content) > 500:
+                    if tname in ("Read", "ViewData", "read_file"):
+                        file_path = tinfo.get("args", {}).get("file_path", "file")
+                        file_name = str(file_path).split("/")[-1]
+                        msg["content"] = f"<read {file_name}>"
+                    elif tname in ("Bash", "run_command"):
+                        command = tinfo.get("args", {}).get("command", "command")
+                        msg["content"] = f"<bash '{str(command)[:50]}...'>"
+                    elif tname in ("Grep", "grep_search"):
+                        msg["content"] = f"<{tname} output truncated>"
+                    else:
+                        msg["content"] = content[:500] + f"... [{tname} output truncated]"
+
+        now = datetime.datetime.now(datetime.timezone.utc).astimezone()
+        date_str = now.strftime("%d_%m")
+        dump_filename = f"sandbox/messages_dump_{date_str}_{session_id}.json"
+        
+        dump_data = {
+            "request_timestamp": now.isoformat(),
+            "messages": debug_messages
+        }
+        
+        with open(dump_filename, "w") as f:
+            json.dump(dump_data, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        warning(
+            LogRecord(
+                event=LogEvent.REQUEST_FAILURE.value,
+                message=f"Failed to dump messages: {e}",
+            )
+        )
+
+    return final_openai_messages
 
 def convert_anthropic_tools_to_openai(
     anthropic_tools: Optional[List[Tool]],
@@ -1438,9 +1538,19 @@ def convert_openai_to_anthropic_response(
 
         anthropic_stop_reason = stop_reason_map.get(finish_reason, "end_turn")
 
+        reasoning = getattr(message, "reasoning_content", "") or ""
+        if not reasoning and getattr(message, "model_extra", None):
+            reasoning = message.model_extra.get("reasoning_content", "") or message.model_extra.get("reasoning", "") or ""
+            
+        content_str = ""
+        if reasoning:
+            content_str += f"```thinking\n{reasoning}\n```\n"
         if message.content:
+            content_str += message.content
+
+        if content_str:
             anthropic_content.append(
-                ContentBlockText(type="text", text=message.content)
+                ContentBlockText(type="text", text=content_str)
             )
 
         if message.tool_calls:
@@ -1538,6 +1648,11 @@ def _get_anthropic_error_details_from_exc(
         if hasattr(exc, "body") and isinstance(exc.body, dict):
             actual_error_details = exc.body.get("error", exc.body)
             provider_details = extract_provider_error_details(actual_error_details)
+            if provider_details and provider_details.provider_name:
+                if error_message == "Provider returned error":
+                    error_message = f"{provider_details.provider_name} returned error"
+                else:
+                    error_message = f"[{provider_details.provider_name}] {error_message}"
 
     if isinstance(exc, openai.AuthenticationError):
         error_type = AnthropicErrorType.AUTHENTICATION
@@ -1596,12 +1711,17 @@ async def handle_anthropic_streaming_response_from_openai_stream(
 
     next_anthropic_block_idx = 0
     text_block_anthropic_idx: Optional[int] = None
+    current_open_anthropic_block_idx: Optional[int] = None
+    
+    is_reasoning = False
+    has_started_reasoning = False
 
     openai_tool_idx_to_anthropic_block_idx: Dict[int, int] = {}
 
     tool_states: Dict[int, Dict[str, Any]] = {}
 
     sent_tool_block_starts: set[int] = set()
+    closed_anthropic_blocks: set[int] = set()
 
     output_token_count = 0
     final_anthropic_stop_reason: StopReasonType = None
@@ -1724,11 +1844,41 @@ async def handle_anthropic_streaming_response_from_openai_stream(
             delta = chunk.choices[0].delta
             openai_finish_reason = chunk.choices[0].finish_reason
 
-            if delta.content:
-                output_token_count += len(enc.encode(delta.content))
+            with open("sandbox/stream_dump.jsonl", "a") as f:
+                f.write(json.dumps(chunk.model_dump(), ensure_ascii=False) + "\n")
+
+            reasoning = getattr(delta, "reasoning_content", "") or ""
+            if not reasoning and getattr(delta, "model_extra", None):
+                reasoning = delta.model_extra.get("reasoning_content", "") or delta.model_extra.get("reasoning", "") or ""
+            
+            delta_content = delta.content or ""
+
+            if reasoning or delta_content:
+                text_to_yield = ""
+                if reasoning:
+                    if not has_started_reasoning:
+                        text_to_yield += "```thinking\n"
+                        has_started_reasoning = True
+                        is_reasoning = True
+                    text_to_yield += reasoning
+                
+                if delta_content:
+                    if is_reasoning:
+                        text_to_yield += "\n```\n"
+                        is_reasoning = False
+                    text_to_yield += delta_content
+
+                output_token_count += len(enc.encode(text_to_yield))
+                
                 if text_block_anthropic_idx is None:
                     text_block_anthropic_idx = next_anthropic_block_idx
                     next_anthropic_block_idx += 1
+                
+                if current_open_anthropic_block_idx != text_block_anthropic_idx:
+                    if current_open_anthropic_block_idx is not None and current_open_anthropic_block_idx not in closed_anthropic_blocks:
+                        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': current_open_anthropic_block_idx})}\n\n"
+                        closed_anthropic_blocks.add(current_open_anthropic_block_idx)
+                    current_open_anthropic_block_idx = text_block_anthropic_idx
                     start_text_event = {
                         "type": "content_block_start",
                         "index": text_block_anthropic_idx,
@@ -1739,7 +1889,7 @@ async def handle_anthropic_streaming_response_from_openai_stream(
                 text_delta_event = {
                     "type": "content_block_delta",
                     "index": text_block_anthropic_idx,
-                    "delta": {"type": "text_delta", "text": delta.content},
+                    "delta": {"type": "text_delta", "text": text_to_yield},
                 }
                 yield f"event: content_block_delta\ndata: {json.dumps(text_delta_event)}\n\n"
 
@@ -1798,10 +1948,12 @@ async def handle_anthropic_streaming_response_from_openai_stream(
 
                     if (
                         current_anthropic_tool_block_idx not in sent_tool_block_starts
-                        and tool_state["id"]
-                        and not tool_state["id"].startswith("tool_ph_")
                         and tool_state["name"]
                     ):
+                        if current_open_anthropic_block_idx is not None and current_open_anthropic_block_idx != current_anthropic_tool_block_idx and current_open_anthropic_block_idx not in closed_anthropic_blocks:
+                            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': current_open_anthropic_block_idx})}\n\n"
+                            closed_anthropic_blocks.add(current_open_anthropic_block_idx)
+                        current_open_anthropic_block_idx = current_anthropic_tool_block_idx
                         start_tool_event = {
                             "type": "content_block_start",
                             "index": current_anthropic_tool_block_idx,
@@ -1838,8 +1990,9 @@ async def handle_anthropic_streaming_response_from_openai_stream(
                     final_anthropic_stop_reason = "tool_use"
                 break
 
-        if text_block_anthropic_idx is not None:
-            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': text_block_anthropic_idx})}\n\n"
+        if current_open_anthropic_block_idx is not None and current_open_anthropic_block_idx not in closed_anthropic_blocks:
+            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': current_open_anthropic_block_idx})}\n\n"
+            closed_anthropic_blocks.add(current_open_anthropic_block_idx)
 
         for anthropic_tool_idx in sent_tool_block_starts:
             tool_state_to_finalize = tool_states.get(anthropic_tool_idx)
@@ -1859,9 +2012,10 @@ async def handle_anthropic_streaming_response_from_openai_stream(
                             },
                         )
                     )
-            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': anthropic_tool_idx})}\n\n"
 
-        if final_anthropic_stop_reason is None:
+        if sent_tool_block_starts:
+            final_anthropic_stop_reason = "tool_use"
+        elif final_anthropic_stop_reason is None:
             final_anthropic_stop_reason = "end_turn"
 
         message_delta_event = {
@@ -1964,12 +2118,17 @@ async def handle_anthropic_streaming_from_raw_httpx(
     anthropic_message_id = f"msg_stream_{request_id}_{uuid.uuid4().hex[:8]}"
     next_anthropic_block_idx = 0
     text_block_anthropic_idx: Optional[int] = None
+    current_open_anthropic_block_idx: Optional[int] = None
+    closed_anthropic_blocks = set()
     openai_tool_idx_to_anthropic_block_idx: Dict[int, int] = {}
     tool_states: Dict[int, Dict[str, Any]] = {}
     output_token_count = 0
     final_anthropic_stop_reason: StopReasonType = None
     cache_creation_input_tokens = 0
     cache_read_input_tokens = 0
+    
+    is_reasoning = False
+    has_started_reasoning = False
 
     enc = get_token_encoder(original_anthropic_model_name, request_id)
 
@@ -2041,24 +2200,47 @@ async def handle_anthropic_streaming_from_raw_httpx(
                 choice = choices[0]
                 delta = choice.get("delta", {})
                 finish_reason = choice.get("finish_reason")
+                
+                content = delta.get("content") or ""
+                reasoning = delta.get("reasoning_content") or delta.get("reasoning") or ""
 
-                content = delta.get("content")
-                if content:
-                    output_token_count += len(enc.encode(content))
+                if reasoning or content:
+                    text_to_yield = ""
+                    if reasoning:
+                        if not has_started_reasoning:
+                            text_to_yield += "```thinking\n"
+                            has_started_reasoning = True
+                            is_reasoning = True
+                        text_to_yield += reasoning
+                    
+                    if content:
+                        if is_reasoning:
+                            text_to_yield += "\n```\n"
+                            is_reasoning = False
+                        text_to_yield += content
+                        
+                    output_token_count += len(enc.encode(text_to_yield))
+                    
                     if text_block_anthropic_idx is None:
                         text_block_anthropic_idx = next_anthropic_block_idx
                         next_anthropic_block_idx += 1
-                    start_text_event = {
-                        "type": "content_block_start",
-                        "index": text_block_anthropic_idx,
-                        "content_block": {"type": "text", "text": ""},
-                    }
-                    yield f"event: content_block_start\ndata: {json.dumps(start_text_event)}\n\n"
+                        
+                    if current_open_anthropic_block_idx != text_block_anthropic_idx:
+                        if current_open_anthropic_block_idx is not None and current_open_anthropic_block_idx not in closed_anthropic_blocks:
+                            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': current_open_anthropic_block_idx})}\n\n"
+                            closed_anthropic_blocks.add(current_open_anthropic_block_idx)
+                        current_open_anthropic_block_idx = text_block_anthropic_idx
+                        start_text_event = {
+                            "type": "content_block_start",
+                            "index": text_block_anthropic_idx,
+                            "content_block": {"type": "text", "text": ""},
+                        }
+                        yield f"event: content_block_start\ndata: {json.dumps(start_text_event)}\n\n"
 
                     text_delta_event = {
                         "type": "content_block_delta",
                         "index": text_block_anthropic_idx,
-                        "delta": {"type": "text_delta", "text": content},
+                        "delta": {"type": "text_delta", "text": text_to_yield},
                     }
                     yield f"event: content_block_delta\ndata: {json.dumps(text_delta_event)}\n\n"
 
@@ -2070,14 +2252,17 @@ async def handle_anthropic_streaming_from_raw_httpx(
                             new_idx = next_anthropic_block_idx
                             next_anthropic_block_idx += 1
                             openai_tool_idx_to_anthropic_block_idx[tool_idx] = new_idx
-                            tool_states[tool_idx] = {"name": "", "args_str": ""}
-                            tool_start_event = {
-                                "type": "content_block_start",
-                                "index": new_idx,
-                                "content_block": {"type": "tool_use", "id": f"toolu_{tool_idx}", "name": "", "input": {}},
-                            }
-                            yield f"event: content_block_start\ndata: {json.dumps(tool_start_event)}\n\n"
-
+                            
+                            call_id = tool_call.get("id")
+                            if not call_id:
+                                call_id = f"toolu_{uuid.uuid4().hex[:8]}"
+                            tool_states[tool_idx] = {"name": "", "args_str": "", "started": False, "id": call_id}
+                        else:
+                            call_id = tool_call.get("id")
+                            if call_id and tool_states[tool_idx]["id"].startswith("toolu_"):
+                                if not tool_states[tool_idx]["started"]:
+                                    tool_states[tool_idx]["id"] = call_id
+                            
                         anthropic_idx = openai_tool_idx_to_anthropic_block_idx[tool_idx]
                         tool_state = tool_states[tool_idx]
                         name = tool_call.get("function", {}).get("name")
@@ -2085,27 +2270,30 @@ async def handle_anthropic_streaming_from_raw_httpx(
 
                         if name:
                             tool_state["name"] = name
+                            
+                        if not tool_state["started"] and tool_state["name"]:
+                            if current_open_anthropic_block_idx is not None and current_open_anthropic_block_idx not in closed_anthropic_blocks:
+                                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': current_open_anthropic_block_idx})}\n\n"
+                                closed_anthropic_blocks.add(current_open_anthropic_block_idx)
+                            current_open_anthropic_block_idx = anthropic_idx
+                            
                             tool_start_event = {
                                 "type": "content_block_start",
                                 "index": anthropic_idx,
-                                "content_block": {"type": "tool_use", "id": f"toolu_{tool_idx}", "name": name, "input": {}},
+                                "content_block": {"type": "tool_use", "id": tool_state["id"], "name": tool_state["name"], "input": {}},
                             }
                             yield f"event: content_block_start\ndata: {json.dumps(tool_start_event)}\n\n"
+                            tool_state["started"] = True
                         if args_str:
-                            tool_state["args_str"] += args_str
-                            try:
-                                tool_state["args"] = json.loads(tool_state["args_str"])
-                                args_delta_event = {
-                                    "type": "content_block_delta",
-                                    "index": anthropic_idx,
-                                    "delta": {
-                                        "type": "input_json_delta",
-                                        "partial_json": json.dumps(tool_state["args"]),
-                                    },
-                                }
-                                yield f"event: content_block_delta\ndata: {json.dumps(args_delta_event)}\n\n"
-                            except json.JSONDecodeError:
-                                pass
+                            args_delta_event = {
+                                "type": "content_block_delta",
+                                "index": anthropic_idx,
+                                "delta": {
+                                    "type": "input_json_delta",
+                                    "partial_json": args_str,
+                                },
+                            }
+                            yield f"event: content_block_delta\ndata: {json.dumps(args_delta_event)}\n\n"
 
                 if finish_reason:
                     final_anthropic_stop_reason = openai_to_anthropic_stop_reason_map.get(finish_reason, "end_turn")
@@ -2113,13 +2301,13 @@ async def handle_anthropic_streaming_from_raw_httpx(
             if line.strip() == "[DONE]":
                 break
 
-        if text_block_anthropic_idx is not None:
-            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': text_block_anthropic_idx})}\n\n"
-        for anthropic_idx in openai_tool_idx_to_anthropic_block_idx.values():
-            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': anthropic_idx})}\n\n"
+        if current_open_anthropic_block_idx is not None and current_open_anthropic_block_idx not in closed_anthropic_blocks:
+            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': current_open_anthropic_block_idx})}\n\n"
+            closed_anthropic_blocks.add(current_open_anthropic_block_idx)
 
+        uncached_input_tokens = max(0, estimated_input_tokens - cache_creation_input_tokens - cache_read_input_tokens)
         usage_data = {
-            "input_tokens": estimated_input_tokens,
+            "input_tokens": uncached_input_tokens,
             "output_tokens": output_token_count,
         }
         if cache_creation_input_tokens > 0:
@@ -2199,6 +2387,22 @@ async def handle_anthropic_streaming_from_raw_httpx(
         await httpx_response.aclose()
         await httpx_client.aclose()
 
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+@asynccontextmanager
+async def app_lifespan(app: fastapi.FastAPI):
+    try:
+        dump_dir = Path("sandbox")
+        dump_dir.mkdir(parents=True, exist_ok=True)
+        for p in dump_dir.glob("messages_dump*.json"):
+            try:
+                p.unlink()
+            except Exception:
+                pass
+    except Exception as e:
+        warning(LogRecord(event=LogEvent.HEALTH_CHECK.value, message=f"Failed to clear messages dumps: {e}"))
+    yield
 
 app = fastapi.FastAPI(
     title=settings.app_name,
@@ -2206,11 +2410,88 @@ app = fastapi.FastAPI(
     version=settings.app_version,
     docs_url=None,
     redoc_url=None,
+    lifespan=app_lifespan,
 )
+
+# ──────────────────── Cache Diff Diagnostic ────────────────────
+import hashlib as _hashlib
+
+_DIFF_LOG_PATH = Path(__file__).parent.parent / "cache_diff.log"
+_prev_messages: Dict[str, List[str]] = {}  # model -> list of json-serialized messages
+
+
+def _run_cache_diff_diagnostic(
+    openai_messages: List[Dict[str, Any]], model: str, request_id: str
+) -> None:
+    """Compare current openai_messages with previous request, log diffs."""
+    try:
+        current = [json.dumps(m, sort_keys=True, ensure_ascii=False) for m in openai_messages]
+        hashes = [_hashlib.sha256(s.encode()).hexdigest()[:8] for s in current]
+        debug(LogRecord(LogEvent.OPENAI_REQUEST.value, f"msg hashes: {' '.join(f'[{i}]:{h}' for i, h in enumerate(hashes))}", request_id))
+
+        prev = _prev_messages.get(model)
+        _prev_messages[model] = current
+
+        if prev is None:
+            info(LogRecord(LogEvent.OPENAI_REQUEST.value, f"CACHE-DIFF first request for {model}, storing baseline ({len(current)} msgs)", request_id))
+            return
+
+        lines: list[str] = []
+        lines.append(f"\n{'='*80}")
+        lines.append(f"REQUEST {request_id}  model={model}  msgs: {len(prev)} -> {len(current)}")
+        lines.append(f"{'='*80}")
+
+        changed_indices = []
+        max_common = min(len(prev), len(current))
+
+        for i in range(max_common):
+            if prev[i] == current[i]:
+                continue
+            changed_indices.append(i)
+            role = openai_messages[i].get("role", "?")
+            prev_s, curr_s = prev[i], current[i]
+            diverge_pos = next(
+                (p for p in range(min(len(prev_s), len(curr_s))) if prev_s[p] != curr_s[p]),
+                min(len(prev_s), len(curr_s)),
+            )
+            ctx = 80
+            start = max(0, diverge_pos - ctx)
+
+            lines.append(f"\n  >>> [{i}] role={role}  diverges at char {diverge_pos}/{max(len(prev_s), len(curr_s))}")
+            lines.append(f"    PREV[{start}:{diverge_pos+ctx}]: ...{prev_s[start:diverge_pos+ctx]}...")
+            lines.append(f"    CURR[{start}:{diverge_pos+ctx}]: ...{curr_s[start:diverge_pos+ctx]}...")
+
+            # Narrow zone around divergence
+            fs, fe = max(0, diverge_pos - 30), diverge_pos + 30
+            lines.append(f"    DIFF (+-30 chars @ {diverge_pos}):")
+            lines.append(f"      OLD: <<{prev_s[fs:min(len(prev_s), fe)]}>>")
+            lines.append(f"      NEW: <<{curr_s[fs:min(len(curr_s), fe)]}>>")
+
+        if len(current) > len(prev):
+            lines.append(f"\n  +++ {len(current) - len(prev)} NEW messages appended (indices {len(prev)}..{len(current)-1})")
+        elif len(current) < len(prev):
+            lines.append(f"\n  --- {len(prev) - len(current)} messages REMOVED")
+
+        if not changed_indices and len(current) == len(prev):
+            lines.append("\n  OK all existing messages IDENTICAL")
+
+        diff_text = "\n".join(lines)
+
+        with open(_DIFF_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(diff_text + "\n")
+
+        if changed_indices:
+            info(LogRecord(LogEvent.OPENAI_REQUEST.value, f"CACHE-DIFF msgs changed: {changed_indices} (see cache_diff.log)", request_id))
+        else:
+            debug(LogRecord(LogEvent.OPENAI_REQUEST.value, f"CACHE-DIFF {max_common} common msgs identical, +{len(current)-len(prev)} new", request_id))
+
+    except Exception as e:
+        debug(LogRecord(LogEvent.OPENAI_REQUEST.value, f"CACHE-DIFF error: {e}", request_id))
 
 
 def select_connection(client_model_name: str, request_id: str) -> Tuple[ConnectionConfig, openai.AsyncClient]:
     """Selects the target connection config and client based on the client's request."""
+    check_and_reload_config()
     client_model_lower = client_model_name.lower()
     
     if "opus" in client_model_lower:
@@ -2337,23 +2618,30 @@ async def create_message_proxy(
         anthropic_request_data: Dict[str, Any] = {
             "client_model": client_model,
         }
+
+        # Always extract cache breakpoints from raw incoming body (before Pydantic strips anything)
+        incoming_cache_paths = extract_cache_control_paths(raw_json) if isinstance(raw_json, dict) else []
+        if incoming_cache_paths:
+            anthropic_request_data["cache_breakpoints_incoming"] = incoming_cache_paths
+            debug(
+                LogRecord(
+                    LogEvent.ANTHROPIC_REQUEST.value,
+                    f"Incoming cache breakpoints from Claude Code: {len(incoming_cache_paths)} breakpoint(s)",
+                    request_id,
+                    {"cache_breakpoints": incoming_cache_paths, "count": len(incoming_cache_paths)},
+                )
+            )
+
         if VERBOSE_LOGGING:
             anthropic_request_data["method"] = request.method
             anthropic_request_data["url"] = str(request.url)
             anthropic_request_data["headers"] = mask_secrets(dict(request.headers))
-            try:
-                parsed_raw_body = json.loads(raw_body)
-                anthropic_request_data["body"] = parsed_raw_body
-                cache_paths = extract_cache_control_paths(parsed_raw_body)
-                if cache_paths:
-                    anthropic_request_data["cache_breakpoints"] = cache_paths
-            except Exception:
-                anthropic_request_data["body"] = raw_body
+            anthropic_request_data["body"] = raw_json
 
         debug(
             LogRecord(
                 LogEvent.ANTHROPIC_REQUEST.value,
-                "Received Anthropic request body",
+                "Claude→Proxy",
                 request_id,
                 anthropic_request_data,
             )
@@ -2369,7 +2657,7 @@ async def create_message_proxy(
             )
 
         anthropic_request = MessagesRequest.model_validate(
-            raw_body, context={"request_id": request_id}
+            raw_json, context={"request_id": request_id}
         )
     except json.JSONDecodeError as e:
         return await _log_and_return_error_response(
@@ -2416,9 +2704,16 @@ async def create_message_proxy(
         )
     )
 
+    is_implicit_caching_model = not (
+        target_model_name.startswith("anthropic/") or target_model_name.startswith("google/")
+    )
+
     try:
         openai_messages = convert_anthropic_to_openai_messages(
-            anthropic_request.messages, anthropic_request.system, request_id=request_id
+            anthropic_request.messages, 
+            anthropic_request.system, 
+            request_id=request_id,
+            strip_cache=is_implicit_caching_model
         )
         openai_tools = convert_anthropic_tools_to_openai(anthropic_request.tools)
         openai_tool_choice = convert_anthropic_tool_choice_to_openai(
@@ -2439,6 +2734,12 @@ async def create_message_proxy(
         "max_tokens": anthropic_request.max_tokens,
         "stream": is_stream,
     }
+
+    if is_implicit_caching_model and openai_messages:
+        _run_cache_diff_diagnostic(openai_messages, target_model_name, request_id)
+
+    if is_stream:
+        openai_params["stream_options"] = {"include_usage": True}
     if anthropic_request.temperature is not None:
         openai_params["temperature"] = anthropic_request.temperature
     if anthropic_request.top_p is not None:
@@ -2457,7 +2758,41 @@ async def create_message_proxy(
         openai_params["user"] = user_id_str[:128]
 
     if target_conn.provider:
-        openai_params["extra_body"] = {"provider": {"order": target_conn.provider}}
+        openai_params["extra_body"] = {
+            "provider": {
+                "order": target_conn.provider,
+                "allow_fallbacks": target_conn.allow_fallbacks
+            }
+        }
+
+    if is_implicit_caching_model:
+        debug(
+            LogRecord(
+                LogEvent.OPENAI_REQUEST.value,
+                "Stripped cache_control markers during conversion for implicit prefix caching model",
+                request_id,
+            )
+        )
+
+    # Log cache breakpoints in outgoing request at INFO level for visibility
+    outgoing_cache_paths = extract_cache_control_paths(openai_params)
+    if outgoing_cache_paths:
+        info(
+            LogRecord(
+                LogEvent.OPENAI_REQUEST.value,
+                f"Cache breakpoints in outgoing request: {len(outgoing_cache_paths)} breakpoint(s)",
+                request_id,
+                {"cache_breakpoints": outgoing_cache_paths, "count": len(outgoing_cache_paths)},
+            )
+        )
+    else:
+        warning(
+            LogRecord(
+                LogEvent.OPENAI_REQUEST.value,
+                "No cache breakpoints found in outgoing OpenAI request",
+                request_id,
+            )
+        )
 
     debug(
         LogRecord(
@@ -2477,8 +2812,8 @@ async def create_message_proxy(
                     request_id,
                 )
             )
-            # Try raw httpx streaming for OpenRouter, fallback to OpenAI SDK
-            try:
+            # Use raw httpx streaming for OpenRouter to capture metadata
+            if True:
                 httpx_client = httpx.AsyncClient(
                     verify=False,
                     timeout=180.0,
@@ -2539,35 +2874,31 @@ async def create_message_proxy(
                     ))
                     await httpx_response.aclose()
                     await httpx_client.aclose()
-                    httpx_response.raise_for_status()
+                    
+                    try:
+                        err_json = json.loads(error_body)
+                        actual_err = err_json.get("error", err_json)
+                        provider_details = extract_provider_error_details(actual_err)
+                        err_msg = actual_err.get("message", error_body) if isinstance(actual_err, dict) else error_body
+                    except Exception:
+                        provider_details = None
+                        err_msg = error_body
+                        
+                    err_type = STATUS_CODE_ERROR_MAP.get(httpx_response.status_code, AnthropicErrorType.API_ERROR)
+                    
+                    return await _log_and_return_error_response(
+                        request,
+                        httpx_response.status_code,
+                        err_type,
+                        err_msg,
+                        provider_details,
+                        None
+                    )
 
                 return StreamingResponse(
                     handle_anthropic_streaming_from_raw_httpx(
                         httpx_response,
                         httpx_client,
-                        anthropic_request.model,
-                        estimated_input_tokens,
-                        request_id,
-                        request.state.start_time_monotonic,
-                    ),
-                    media_type="text/event-stream",
-                )
-
-            except Exception as e_httpx:
-                # Fallback to OpenAI SDK if raw httpx fails
-                debug(
-                    LogRecord(
-                        LogEvent.REQUEST_FAILURE.value,
-                        f"Raw httpx streaming failed, falling back to OpenAI SDK: {str(e_httpx)}",
-                        request_id,
-                    )
-                )
-                openai_stream_response = await target_client.chat.completions.create(
-                    **openai_params
-                )
-                return StreamingResponse(
-                    handle_anthropic_streaming_response_from_openai_stream(
-                        openai_stream_response,
                         anthropic_request.model,
                         estimated_input_tokens,
                         request_id,
